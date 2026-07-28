@@ -17,6 +17,18 @@
 import ballerina/ai;
 import ballerina/jballerina.java;
 import ballerina/time;
+import ballerinax/azure_storage_service.blobs;
+
+// Constructs the underlying Azure Blob Storage connector client from the connector's
+// `ConnectionConfig`, wrapping any construction failure as an `ai:Error`.
+isolated function newBlobClient(blobs:ConnectionConfig config) returns blobs:BlobClient|ai:Error {
+    blobs:BlobClient|error blobClient = new (config);
+    if blobClient is error {
+        return error ai:Error(
+            string `Failed to initialize the Azure Blob Storage client: ${blobClient.message()}`, blobClient);
+    }
+    return blobClient;
+}
 
 // How a file's content is turned into text, derived from its MIME type / extension.
 enum DocumentKind {
