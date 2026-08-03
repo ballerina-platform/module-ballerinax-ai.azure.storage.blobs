@@ -38,6 +38,9 @@ generated/
 # Ballerina runtime/test configuration — may hold account keys or SAS tokens
 **/Config.toml
 
+# PR #2 review working document — tracking only, not part of the deliverable
+REVIEW-CHECKLIST.md
+
 # IDE / OS
 .idea/
 *.iml

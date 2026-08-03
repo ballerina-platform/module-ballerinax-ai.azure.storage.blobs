@@ -21,7 +21,35 @@
 // corresponding marker text. A scanned (image-only) PDF fixture exercises the no-text-layer
 // detection path.
 
+import ballerina/ai;
 import ballerina/io;
+
+// Mirrors the loader's fetch path in a single call: classify from listing metadata, skip when
+// the kind is unsupported, otherwise build the document. The loader itself splits these steps
+// so that an unsupported blob is never downloaded (see `TextDataLoader.listPrefix`); a test
+// holds the bytes already, so folding them back together keeps the assertions on one call.
+//
+// Returns `()` at exactly the point the loader would skip the blob.
+isolated function classifyAndBuild(byte[] content, string fileName, string? mimeType = (),
+        decimal? fileSize = (), string? creationTime = (), string? lastModified = ())
+        returns ai:TextDocument?|ai:Error {
+    DocumentKind kind = classify(fileName, mimeType);
+    if !isSupported(kind) {
+        return ();
+    }
+    BlobEntry entry = {
+        name: fileName,
+        contentType: mimeType,
+        contentLength: fileSize,
+        creationTime,
+        lastModified
+    };
+    return buildDocument(content, kind, buildMetadata(entry, TEST_CONTAINER));
+}
+
+// The container name the fixtures attribute documents to, mirroring the `container` field the
+// loader stamps onto every `ai:Metadata`.
+const string TEST_CONTAINER = "test-container";
 
 // A valid PDF (PDFBox) whose only text is `PDF_TEXT`.
 final readonly & byte[] PDF_BYTES = base64 `JVBERi0xLjYKJfbk/N8KMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovVmVyc2lvbiAvMS42Ci9QYWdlcyAyIDAgUgo+PgplbmRvYmoKNyAwIG9iago8PAovTGVuZ3RoIDYzCi9GaWx0ZXIgL0ZsYXRlRGVjb2RlCj4+CnN0cmVhbQ0KeJxzCuHSdzNUMDRSCEnjMjdSMDcwUAhJ4dLwzU/OVghwcVNIyU8uzU3NK1EoSa0o0dNUCMnicg3hAgB6Ew6iDQplbmRzdHJlYW0KZW5kb2JqCjggMCBvYmoKPDwKL0xlbmd0aCAxODcKL1R5cGUgL09ialN0bQovTiA1Ci9GaWx0ZXIgL0ZsYXRlRGVjb2RlCi9GaXJzdCAyNwo+PgpzdHJlYW0NCnicVY7dCoJAEIVf5TxB4/qLIEJKEUQQFnQhXpgushC74WrU2zcq9HMxA+ebMzPHhQMPvgsfwosRQAQhQohIIEno/LpL0LHupAXtVWtRerxQoALlZtQDBNL03wk6yFbVmXmidFYOpgqFyz2Kp15Ntl7yrjufokJaM/YNv/AXkBs98NwimvXyYMuQ4/0AwTm/cgkwu+g0XodZTlCAstrKZbKTt4ccVFODNroxrdId6KL0Wlv1AXzwDSMNTM0NCmVuZHN0cmVhbQplbmRvYmoKOSAwIG9iago8PAovTGVuZ3RoIDMzCi9Sb290IDEgMCBSCi9JRCBbPDJCNjNCNTM5MzY2MDE0NTkyNDVCQTYwN0Y4RTRERjNFNTJENUZBNUZEMjBCQTVGQjc1QUNGMjJDRUUzQzE4NTM+IDwyQjYzQjUzOTM2NjAxNDU5MjQ1QkE2MDdGOEU0REYzRTUyRDVGQTVGRDIwQkE1RkI3NUFDRjIyQ0VFM0MxODUzPl0KL1R5cGUgL1hSZWYKL1NpemUgMTAKL0luZGV4IFswIDldCi9XIFsxIDEgMV0KL0ZpbHRlciAvRmxhdGVEZWNvZGUKPj4Kc3RyZWFtDQp4nGNg+M/Iz8DEAUSMTBxMTBzMTBwsjH4MjNcYACDYAnINCmVuZHN0cmVhbQplbmRvYmoKc3RhcnR4cmVmCjUwNAolJUVPRgo=`;

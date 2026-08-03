@@ -14,6 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import ballerina/http;
 import ballerina/test;
 import ballerinax/azure_storage_service.blobs;
 
@@ -47,10 +48,11 @@ isolated function testSourceExplicitValues() {
 isolated function testNewBlobClientWithSas() returns error? {
     blobs:ConnectionConfig config = {
         accountName: "contosostorage",
-        accessKeyOrSAS: "sv=2022-11-02&ss=b&srt=co&sp=rl&sig=abc",
+        // A SAS token is the query string including the leading `?`.
+        accessKeyOrSAS: "?sv=2022-11-02&ss=b&srt=co&sp=rl&sig=abc",
         authorizationMethod: blobs:SAS
     };
-    blobs:BlobClient _ = check newBlobClient(config);
+    _ = check newBlobClient(config);
 }
 
 @test:Config {}
@@ -61,7 +63,59 @@ isolated function testNewBlobClientWithAccessKey() returns error? {
         accessKeyOrSAS: "dGhpcy1pcy1hLWZha2Uta2V5LWZvci10ZXN0aW5n",
         authorizationMethod: blobs:ACCESS_KEY
     };
-    blobs:BlobClient _ = check newBlobClient(config);
+    _ = check newBlobClient(config);
+}
+
+@test:Config {}
+isolated function testNewBlobClientLeavesCallerConfigUntouched() returns error? {
+    // The defaulting in `newBlobClient` works on a spread copy, so the caller's own record
+    // must come back out with `retryConfig`/`responseLimits` still unset.
+    blobs:ConnectionConfig config = {
+        accountName: "contosostorage",
+        accessKeyOrSAS: "?sv=2022-11-02&sig=abc",
+        authorizationMethod: blobs:SAS
+    };
+    _ = check newBlobClient(config);
+    test:assertTrue(config.retryConfig is (), "The caller's config must not be mutated");
+    test:assertTrue(config.responseLimits is (), "The caller's config must not be mutated");
+}
+
+@test:Config {}
+isolated function testNewBlobClientAcceptsAnImmutableConfig() returns error? {
+    // A readonly config would make an in-place `clone()`-based defaulting fail; the spread
+    // copy must accept it.
+    blobs:ConnectionConfig & readonly config = {
+        accountName: "contosostorage",
+        accessKeyOrSAS: "?sv=2022-11-02&sig=abc",
+        authorizationMethod: blobs:SAS
+    };
+    _ = check newBlobClient(config);
+}
+
+@test:Config {}
+isolated function testNewBlobClientHonoursAnExplicitRetryConfig() returns error? {
+    // An explicit value always wins over the default — including one that deliberately
+    // disables retrying.
+    http:RetryConfig noRetry = {count: 0, interval: 0};
+    blobs:ConnectionConfig config = {
+        accountName: "contosostorage",
+        accessKeyOrSAS: "?sv=2022-11-02&sig=abc",
+        authorizationMethod: blobs:SAS,
+        retryConfig: noRetry
+    };
+    _ = check newBlobClient(config);
+    test:assertEquals(config.retryConfig?.count, 0, "The caller's retry policy is preserved");
+}
+
+@test:Config {}
+isolated function testDefaultRetryConfigDoesNotRetry403() {
+    // Azure Storage uses 403 for authorization failures (bad Shared Key signature, expired or
+    // under-scoped SAS), never for throttling — retrying one cannot help.
+    test:assertTrue(DEFAULT_RETRY_CONFIG.statusCodes.indexOf(403) is (),
+            "403 must not be in the default retry status codes");
+    test:assertTrue(DEFAULT_RETRY_CONFIG.statusCodes.indexOf(503) !is (),
+            "503 ServerBusy is Azure's throttling signal and must be retried");
+    test:assertTrue(DEFAULT_RETRY_CONFIG.statusCodes.indexOf(429) !is ());
 }
 
 // ---- BlobEntry shape ---------------------------------------------------------

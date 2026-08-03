@@ -17,70 +17,108 @@
 import ballerina/ai;
 import ballerina/jballerina.java;
 import ballerina/time;
-import ballerinax/azure_storage_service.blobs;
 
-// Constructs the underlying Azure Blob Storage connector client from the connector's
-// `ConnectionConfig`, wrapping any construction failure as an `ai:Error`.
-isolated function newBlobClient(blobs:ConnectionConfig config) returns blobs:BlobClient|ai:Error {
-    blobs:BlobClient|error blobClient = new (config);
-    if blobClient is error {
-        return error ai:Error(
-            string `Failed to initialize the Azure Blob Storage client: ${blobClient.message()}`, blobClient);
-    }
-    return blobClient;
-}
-
-// How a file's content is turned into text, derived from its MIME type / extension.
+// How a blob's content is turned into text, derived from its MIME type / extension. The
+// classification is made from LISTING metadata, before the blob is downloaded, so an
+// unsupported blob costs no bandwidth at all.
 enum DocumentKind {
-    // Inherently textual; decoded directly from its bytes.
+    // Inherently textual; decoded directly from its bytes and used verbatim.
     PLAIN_TEXT,
+    // HTML or XHTML: decoded like plain text, then RENDERED to plain text, so tags and
+    // character references never reach the document body.
+    MARKUP,
     // A PDF or Microsoft Office document whose text is extracted via Apache Tika
     // (PDFBox for PDF, Apache POI for Office).
     EXTRACTABLE,
-    // Cannot be represented as text (images, audio, unknown binary); skipped.
+    // Cannot be represented as text (images, audio, unknown binary); skipped in prefix
+    // listings, rejected when the blob is named explicitly.
     UNSUPPORTED
 }
 
-// Builds an `ai:TextDocument` from downloaded blob content, extracting the text of PDF
-// and Microsoft Office documents via Apache Tika. Returns `()` for content that cannot be
-// represented as text (images, audio, unknown binary), signalling the caller to skip.
-isolated function buildDocument(byte[] content, string fileName, string? mimeType, decimal? fileSize,
-        string? createdDateTime, string? modifiedDateTime) returns ai:TextDocument?|ai:Error {
-    ai:Metadata metadata = {fileName};
+// Reports whether a document kind can be loaded as a text document at all. The caller
+// classifies first and consults this before fetching, so the decision to skip is explicit
+// rather than implied by a nil document.
+isolated function isSupported(DocumentKind kind) returns boolean =>
+    kind == PLAIN_TEXT || kind == MARKUP || kind == EXTRACTABLE;
+
+// Builds `ai:Metadata` from a normalized listing entry. Azure reports a blob's `Content-Type`
+// and `Content-Length` in the listing, so `mimeType` and `fileSize` are populated here;
+// timestamps are parsed defensively (see `toUtc`) and simply omitted when unparseable.
+//
+// The container is retained as an extra field: `fileName` alone is not unique across a load
+// that spans several containers, so `container` + `fileName` is the durable key a caller needs
+// to trace a document back to the blob it came from.
+isolated function buildMetadata(BlobEntry entry, string container) returns ai:Metadata {
+    ai:Metadata metadata = {fileName: entry.name};
+    string? mimeType = entry.contentType;
     if mimeType is string {
         metadata.mimeType = mimeType;
     }
+    decimal? fileSize = entry.contentLength;
     if fileSize is decimal {
         metadata.fileSize = fileSize;
     }
-    time:Utc? createdAt = toUtc(createdDateTime);
+    time:Utc? createdAt = toUtc(entry.creationTime);
     if createdAt is time:Utc {
         metadata.createdAt = createdAt;
     }
-    time:Utc? modifiedAt = toUtc(modifiedDateTime);
+    time:Utc? modifiedAt = toUtc(entry.lastModified);
     if modifiedAt is time:Utc {
         metadata.modifiedAt = modifiedAt;
     }
+    metadata["container"] = container;
+    return metadata;
+}
 
-    match classify(fileName, mimeType) {
-        PLAIN_TEXT => {
-            string|error text = string:fromBytes(content);
-            if text is error {
-                return error ai:Error(
-                    string `Failed to decode text content of '${fileName}': ${text.message()}`, text);
-            }
-            return {content: text, metadata};
+// Builds an `ai:TextDocument` from downloaded blob content, extracting the text of PDF and
+// Microsoft Office documents via Apache Tika. Only ever called for a supported kind (see
+// `isSupported`), so an `UNSUPPORTED` blob reaching here is a caller bug rather than a
+// silently empty result.
+//
+// Decoding honours a byte-order mark first, then the `charset` Azure declared on the blob's
+// Content-Type, then UTF-8, and strips any BOM (see `decodeText`). HTML is rendered to plain
+// text rather than stored as raw markup, so tags and character references never reach the
+// document body.
+isolated function buildDocument(byte[] content, DocumentKind kind, ai:Metadata metadata)
+        returns ai:TextDocument|ai:Error {
+    string fileName = metadata.fileName ?: "<unnamed>";
+    // The raw Content-Type, parameters included: the essence selects the Tika parser, the
+    // `charset` parameter decides how text bytes are decoded.
+    string contentType = metadata.mimeType ?: "";
+    if kind == EXTRACTABLE {
+        string|error text = extractText(content, fileName, essenceOf(contentType));
+        if text is error {
+            return error ai:Error(
+                string `Failed to extract text from '${fileName}': ${text.message()}`, text);
         }
-        EXTRACTABLE => {
-            string|error text = extractText(content, fileName, mimeType ?: "");
-            if text is error {
-                return error ai:Error(
-                    string `Failed to extract text from '${fileName}': ${text.message()}`, text);
-            }
-            return {content: text, metadata};
-        }
+        return {content: text, metadata};
     }
-    return ();
+    if kind == PLAIN_TEXT || kind == MARKUP {
+        string|error text = decodeText(content, charsetFromContentType(contentType));
+        if text is error {
+            return error ai:Error(
+                string `Failed to decode text content of '${fileName}': ${text.message()}`, text);
+        }
+        // An HTML blob is textually meaningful only once its markup is rendered away; leaving
+        // the tags in place injects markup tokens into every embedding downstream.
+        return {content: kind == MARKUP ? htmlToText(text) : text, metadata};
+    }
+    return error ai:Error(string `Internal error: '${fileName}' was routed to document ` +
+        string `construction but is not a supported text type`);
+}
+
+// Extracts the `charset` parameter from a `Content-Type`, or `""` when it declares none.
+// Azure echoes back the charset recorded on the blob at upload time.
+isolated function charsetFromContentType(string contentType) returns string {
+    int? charsetIndex = contentType.toLowerAscii().indexOf("charset=");
+    if charsetIndex is () {
+        return "";
+    }
+    string rest = contentType.substring(charsetIndex + "charset=".length());
+    // The charset parameter may be followed by further parameters, and may be quoted.
+    int? separator = rest.indexOf(";");
+    string charset = separator is int ? rest.substring(0, separator) : rest;
+    return re `"`.replaceAll(charset.trim(), "");
 }
 
 // Extracts plain text from a PDF or Microsoft Office document using Apache Tika, reading
@@ -96,6 +134,26 @@ isolated function extractText(byte[] content, string fileName, string mimeType)
     name: "extractText"
 } external;
 
+// Decodes downloaded text bytes. The charset is resolved from a byte-order mark first (which is
+// authoritative and self-describing), then from `charset`, then UTF-8; any BOM is stripped so
+// it never reaches the document body. Decoding is strict, so genuinely corrupt content still
+// surfaces as an error rather than as replacement characters.
+//
+// `string:fromBytes` is deliberately not used: it is strict UTF-8 only, which makes a
+// BOM-prefixed CSV carry a stray `U+FEFF` into its first cell and makes a UTF-16 blob fail to
+// load at all.
+isolated function decodeText(byte[] content, string charset) returns string|error = @java:Method {
+    'class: "io.ballerina.lib.ai.azure.storage.blobs.TextDecoder",
+    name: "decodeText"
+} external;
+
+// Renders HTML markup as plain text: drops script/style bodies and comments, turns block
+// boundaries into line breaks, strips the remaining tags and resolves character references.
+isolated function htmlToText(string html) returns string = @java:Method {
+    'class: "io.ballerina.lib.ai.azure.storage.blobs.TextDecoder",
+    name: "htmlToText"
+} external;
+
 // The sentinel phrase the native extractor embeds when a PDF parses successfully but yields
 // no text — a scanned / image-only document, or an empty one (see TextExtractor.SCANNED_PDF_MESSAGE).
 // Kept to the stable substring of that message, since the surrounding wording has been reworded
@@ -108,20 +166,55 @@ const string SCANNED_PDF_SENTINEL = "no extractable text";
 isolated function isScannedPdfError(error err) returns boolean =>
     err.message().includes(SCANNED_PDF_SENTINEL);
 
-// Classifies a file by how its text is obtained, using MIME type then extension.
+// Classifies a blob by how its text is obtained. The `Content-Type` Azure reports is
+// authoritative and settles the class on its own; the blob-name extension is consulted only as
+// a fallback, when the Content-Type is missing or unrecognised.
+//
+// The ordering matters. Azure lets a blob's name and its Content-Type be set independently, so
+// evaluating the extension first would let a PDF stored as `notes.txt` be UTF-8 decoded instead
+// of Tika-extracted, producing a document of binary garbage rather than the PDF's text.
+//
+// The fallback still carries most real containers: `application/octet-stream` is what Azure
+// records for a blob uploaded without an explicit Content-Type, and it is not in either table,
+// so such a blob drops through to its extension exactly as before.
 isolated function classify(string fileName, string? mimeType) returns DocumentKind {
-    string mime = (mimeType ?: "").toLowerAscii();
+    string mime = essenceOf(mimeType);
+    if mime != "" {
+        // Checked before the generic `text/` rule, which `text/html` would otherwise satisfy.
+        if MARKUP_MIME_TYPES.indexOf(mime) !is () {
+            return MARKUP;
+        }
+        if mime.startsWith("text/") || TEXT_MIME_TYPES.indexOf(mime) !is () {
+            return PLAIN_TEXT;
+        }
+        // PDF and Microsoft Office documents are extracted via Apache Tika (PDFBox / POI).
+        if EXTRACTABLE_MIME_TYPES.indexOf(mime) !is () {
+            return EXTRACTABLE;
+        }
+    }
+
     string extension = getExtension(fileName);
-    if mime.startsWith("text/") || (mime != "" && TEXT_MIME_TYPES.indexOf(mime) !is ())
-            || TEXT_EXTENSIONS.indexOf(extension) !is () {
+    if MARKUP_EXTENSIONS.indexOf(extension) !is () {
+        return MARKUP;
+    }
+    if TEXT_EXTENSIONS.indexOf(extension) !is () {
         return PLAIN_TEXT;
     }
-    // PDF and Microsoft Office documents are extracted via Apache Tika (PDFBox / POI).
-    if (mime != "" && EXTRACTABLE_MIME_TYPES.indexOf(mime) !is ())
-            || EXTRACTABLE_EXTENSIONS.indexOf(extension) !is () {
+    if EXTRACTABLE_EXTENSIONS.indexOf(extension) !is () {
         return EXTRACTABLE;
     }
     return UNSUPPORTED;
+}
+
+// Reduces a `Content-Type` to its essence: the lower-cased `type/subtype`, with any parameters
+// and surrounding whitespace stripped. Azure echoes back whatever Content-Type was set at
+// upload — `text/plain; charset=UTF-8`, `application/pdf; version=1.7` — while the MIME tables
+// below hold bare essences, so an exact match against the raw header would miss every
+// parameterised value.
+isolated function essenceOf(string? contentType) returns string {
+    string value = (contentType ?: "").trim().toLowerAscii();
+    int? separator = value.indexOf(";");
+    return separator is int ? value.substring(0, separator).trim() : value;
 }
 
 // Returns the lower-cased file extension (without the dot), or `""` if none.
@@ -191,8 +284,12 @@ isolated function normalizeBlobPath(string path) returns string {
 // Reports whether a blob lies directly under a prefix (no further `/` in the remainder),
 // i.e. it is not inside a virtual sub-folder. Used for non-recursive listings, where a
 // prefix listing otherwise returns blobs at every depth.
+//
+// A name that does not start with the prefix is not under it at all. The server-side prefix
+// filter means that should never happen, but a length-only check would take the remainder from
+// the wrong offset and answer about a substring of an unrelated name.
 isolated function isDirectChild(string blobName, string prefix) returns boolean {
-    if blobName.length() < prefix.length() {
+    if !blobName.startsWith(prefix) {
         return false;
     }
     return !blobName.substring(prefix.length()).includes("/");
@@ -230,21 +327,72 @@ isolated function propDecimal(map<json> properties, string key) returns decimal?
     return ();
 }
 
+// Reports whether a blob name can be addressed through the connector at all.
+//
+// ⬆️ UPSTREAM: `ballerinax/azure_storage_service.blobs` interpolates the blob name straight
+// into the request path without percent-encoding it. Three characters that are legal in an
+// Azure blob name therefore break:
+//
+// - `#` starts a URI fragment, so the path is silently TRUNCATED at it and the request either
+//   404s or, worse, addresses a different blob than the one intended;
+// - `%` begins a percent-escape the server then fails to decode, giving a 400;
+// - non-ASCII is sent raw, which is not valid in a request line and is rejected or mangled.
+//
+// The loader cannot fix this — pre-encoding the name here would be double-encoded for SAS auth
+// and would break the Shared Key signature, which is computed over the decoded resource path.
+// So such blobs are identified and skipped with a clear warning instead of failing with an
+// opaque 400/404 from somewhere deep in the connector. See the README's "Blob name
+// limitations".
+isolated function isAddressableBlobName(string blobName) returns boolean {
+    if blobName.includes("#") || blobName.includes("%") {
+        return false;
+    }
+    // Any code point above U+007F is non-ASCII. `blobName.toBytes()` is UTF-8, so a name that
+    // is pure ASCII has exactly as many bytes as code points.
+    return blobName.toBytes().length() == blobName.length();
+}
+
+// Parses a numeric header value (e.g. `Content-Length`) as a `decimal`, or `()` when the
+// value is absent or not a number.
+isolated function decimalFromString(string? value) returns decimal? {
+    if value is () {
+        return ();
+    }
+    decimal|error parsed = decimal:fromString(value.trim());
+    return parsed is decimal ? parsed : ();
+}
+
 // MIME types (outside the `text/` family) treated as text.
 final readonly & string[] TEXT_MIME_TYPES = [
     "application/json",
     "application/xml",
-    "application/xhtml+xml",
     "application/javascript",
     "application/x-yaml",
     "application/yaml",
     "application/csv"
 ];
 
-// File extensions treated as text.
+// MIME types whose content is markup, decoded and then rendered to plain text. Matched before
+// the generic `text/` rule, which `text/html` would otherwise satisfy.
+final readonly & string[] MARKUP_MIME_TYPES = [
+    "text/html",
+    "application/xhtml+xml"
+];
+
+// File extensions whose content is markup, used only when the Content-Type is missing or
+// unrecognised.
+final readonly & string[] MARKUP_EXTENSIONS = ["html", "htm", "xhtml"];
+
+// File extensions treated as text, used only when the Content-Type is missing or unrecognised.
+//
+// `ts` is deliberately absent: it is TypeScript source *and* an MPEG transport stream, and a
+// video misread as text would be downloaded in full only to produce a document of binary
+// garbage. TypeScript is not lost where it is typed correctly — a `.ts` blob served as
+// `text/plain` (or any `text/*`) still classifies as text through the MIME branch, which
+// `classify` evaluates first.
 final readonly & string[] TEXT_EXTENSIONS = [
-    "txt", "text", "md", "markdown", "csv", "tsv", "json", "xml", "html", "htm",
-    "yaml", "yml", "log", "ini", "conf", "properties", "css", "js", "ts"
+    "txt", "text", "md", "markdown", "csv", "tsv", "json", "xml",
+    "yaml", "yml", "log", "ini", "conf", "properties", "css", "js"
 ];
 
 // MIME types whose text is extracted via Apache Tika: PDF (PDFBox) and Microsoft

@@ -19,47 +19,139 @@ import ballerina/log;
 import ballerinax/azure_storage_service.blobs;
 
 # A data loader that retrieves documents from Azure Blob Storage containers as text.
+#
+# Inherently textual blobs (`txt`, `md`, `json`, `csv`, …) are decoded from their bytes; PDFs
+# and Microsoft Office documents have their text extracted via Apache Tika. See the module
+# documentation for the container/prefix model and the supported and unsupported blob types.
 @display {
     label: "Azure Blob Storage Text Data Loader"
 }
 public isolated class TextDataLoader {
     *ai:DataLoader;
 
-    private final blobs:BlobClient blobClient;
-    private final readonly & Source[] sources;
+    // The public class is a thin shell over `BlobLoader`, which holds every piece of load logic
+    // and talks to a `BlobStore` rather than to `blobs:BlobClient` directly. That split is what
+    // makes the load path testable: a test constructs a `BlobLoader` over a fake store, while
+    // this class's public surface — and the connector types in it — stay exactly as documented.
+    private final BlobLoader loader;
 
     # Initializes the Azure Blob Storage data loader.
     #
-    # + connection - The authentication and service configuration shared by all sources, or an
-    #                existing `blobs:BlobClient` to reuse. A supplied client is not owned by the
-    #                loader: the caller remains responsible for its lifecycle.
+    # The connection may be given in either of two forms:
+    #
+    # - a `blobs:ConnectionConfig` (Shared Key or SAS) — the loader constructs and owns its own
+    #   connector client, filling in a retry policy and a response-size cap when the caller set
+    #   neither; or
+    # - an already-constructed `blobs:BlobClient` — the loader reuses it, so a caller that
+    #   already talks to the storage account does not pay for a second HTTP connection pool.
+    #
+    # A caller-supplied client is **not owned** by the loader: the loader never closes or
+    # reconfigures it, and the caller remains responsible for its lifecycle — including the
+    # retry and response-limit settings, which are left exactly as the caller configured them.
+    #
+    # Every source is fully validated and normalized here rather than at load time, so a
+    # misconfigured source fails immediately instead of part-way through a long load, after
+    # documents have already been fetched and then discarded.
+    #
+    # + connection - The Azure Blob Storage connector configuration shared by all sources, or an
+    #                existing `blobs:BlobClient` to reuse (not owned by the loader)
     # + sources - One or more Azure Blob containers to load documents from
-    # + return - An `ai:Error` if the loader could not be initialized
+    # + return - An `ai:Error` if the loader could not be initialized or a source is invalid
     public isolated function init(
             @display {label: "Connection"} blobs:ConnectionConfig|blobs:BlobClient connection,
             @display {label: "Data Sources"} Source[] sources) returns ai:Error? {
-        if sources.length() == 0 {
-            return error ai:Error("At least one source must be provided to the Azure Blob Storage data loader");
-        }
-        self.sources = sources.cloneReadOnly();
-        self.blobClient = connection is blobs:BlobClient ? connection : check newBlobClient(connection);
+        // Sources are validated before the connection is resolved, so a misconfigured source
+        // fails identically for both connection forms.
+        ResolvedSource[] resolved = check resolveSources(sources);
+        blobs:BlobClient blobClient =
+            connection is blobs:BlobClient ? connection : check newBlobClient(connection);
+        self.loader = new (new ConnectorBlobStore(blobClient), resolved);
     }
 
     # Loads the configured Azure Blob Storage documents.
     #
     # + return - The loaded document when a single blob is resolved, an array of documents
     #            otherwise, or an `ai:Error` on failure
-    public isolated function load() returns ai:Document[]|ai:Document|ai:Error {
+    public isolated function load() returns ai:Document[]|ai:Document|ai:Error => self.loader.load();
+}
+
+// Validates and normalizes the configured sources up front, so a misconfigured source fails at
+// `init` rather than part-way through a long load, after documents have already been fetched
+// and then discarded.
+isolated function resolveSources(Source[] sources) returns ResolvedSource[]|ai:Error {
+    if sources.length() == 0 {
+        return error ai:Error("At least one source must be provided to the Azure Blob Storage data loader");
+    }
+    ResolvedSource[] resolved = [];
+    foreach Source src in sources {
+        string container = src.container.trim();
+        if container == "" {
+            return error ai:Error("A source container name must not be empty");
+        }
+        // A source that names no path loads nothing. Silently returning zero documents here
+        // while an empty `sources` array is a hard error would give the caller the same
+        // outcome from a clear failure in one case and total silence in the other.
+        if src.paths.length() == 0 {
+            log:printWarn("An Azure Blob Storage source selects no paths and will load no " +
+                    "documents; set 'paths' (it defaults to [\"/\"], the whole container)",
+                    container = container);
+        }
+        string[] paths = [];
+        foreach string rawPath in src.paths {
+            string path = normalizeBlobPath(rawPath);
+            // ⬆️ UPSTREAM (see `isAddressableBlobName`): the connector percent-encodes neither
+            // the request path nor the `prefix` query parameter, so such a path cannot be
+            // requested at all. Rejected here rather than at load time, because a configured
+            // path is a deliberate choice and the resulting 400 would name nothing useful.
+            if !isAddressableBlobName(path) {
+                return error ai:Error(string `The path '${rawPath}' cannot be used: the Azure ` +
+                    string `Storage connector does not percent-encode request paths, so blob ` +
+                    string `names and prefixes containing '#', '%' or non-ASCII characters are ` +
+                    string `not addressable`);
+            }
+            paths.push(path);
+        }
+        resolved.push({
+            container,
+            paths,
+            recursive: src.recursive,
+            includeExtensions: src.includeExtensions,
+            // The `"*"` container applies the same paths to every container in the account,
+            // where a path need not exist in all of them.
+            tolerateMissing: container == "*"
+        });
+    }
+    return resolved;
+}
+
+// The loader's whole load path, expressed against the `BlobStore` seam rather than the
+// connector client. `TextDataLoader` wraps this with the production store; tests wrap it with a
+// fake one.
+isolated class BlobLoader {
+    private final BlobStore store;
+    private final readonly & ResolvedSource[] sources;
+
+    isolated function init(BlobStore store, ResolvedSource[] sources) {
+        self.store = store;
+        self.sources = sources.cloneReadOnly();
+    }
+
+    isolated function load() returns ai:Document[]|ai:Document|ai:Error {
         ai:Document[] documents = [];
-        foreach Source src in self.sources {
+        // Sources may overlap — `paths: ["/", "/reports"]`, the same container named twice, or
+        // a container reached both directly and through `"*"`. Without this, the same blob
+        // becomes two documents and is duplicated in whatever index the caller builds, having
+        // been downloaded twice to get there. Shared across the whole load, so it de-duplicates
+        // between sources, not just within one.
+        map<boolean> seen = {};
+        // Sources arrive already normalized and validated (see `init`), so the load path cannot
+        // fail on a configuration mistake half-way through.
+        foreach ResolvedSource src in self.sources {
             string[] containers = check self.resolveContainers(src.container);
-            // A `"*"` container applies the paths to every container, where a path need
-            // not exist in all of them, so a missing path is tolerated rather than an error.
-            boolean tolerateMissing = src.container == "*";
             foreach string container in containers {
-                foreach string rawPath in src.paths {
-                    ai:Document[] loaded = check self.loadPrefix(container, rawPath,
-                            src.recursive, src.includeExtensions, tolerateMissing);
+                foreach string path in src.paths {
+                    ai:Document[] loaded = check self.loadPath(container, path, src.recursive,
+                            src.includeExtensions, src.tolerateMissing, seen);
                     documents.push(...loaded);
                 }
             }
@@ -78,14 +170,17 @@ public isolated class TextDataLoader {
         }
         string[] names = [];
         string? marker = ();
+        int pages = 0;
         while true {
-            blobs:ListContainerResult|error result = self.blobClient->listContainers((), marker, ());
+            blobs:ListContainerResult|error result = self.store->listContainers(marker);
             if result is error {
                 return error ai:Error(string `Failed to list containers: ${result.message()}`, result);
             }
             foreach blobs:Container resolved in result.containerList {
                 names.push(resolved.Name);
             }
+            pages += 1;
+            check guardPagination(result.nextMarker, marker, pages, "the container listing");
             if result.nextMarker == "" {
                 break;
             }
@@ -94,54 +189,76 @@ public isolated class TextDataLoader {
         return dedupeStrings(names);
     }
 
-    // Loads a single configured path. A path with a trailing `/` (or the container root) is
-    // treated as a folder prefix. A path without one is first tried as an explicitly named
-    // blob; if no such blob exists it is treated as a folder prefix, unless it looks like a
-    // file (has an extension), in which case a missing blob is an error (typo detection) —
-    // except under `tolerateMissing` (the `"*"` case), where it is skipped.
-    private isolated function loadPrefix(string container, string rawPath, boolean recursive,
-            string[]? includeExtensions, boolean tolerateMissing) returns ai:Document[]|ai:Error {
-        string normalized = normalizeBlobPath(rawPath);
-        if normalized == "" || normalized.endsWith("/") {
-            return self.listPrefix(container, normalized, recursive, includeExtensions, tolerateMissing);
+    // Loads a single normalized path. An empty path (the container root) or one ending in `/`
+    // is a folder prefix. Any other path is first probed as an explicitly named blob; if no
+    // such blob exists it is treated as a folder prefix, unless it looks like a file (has an
+    // extension), in which case a missing blob is an error (typo detection) — except under
+    // `tolerateMissing` (the `"*"` case), where it is skipped.
+    private isolated function loadPath(string container, string path, boolean recursive,
+            string[]? includeExtensions, boolean tolerateMissing, map<boolean> seen)
+            returns ai:Document[]|ai:Error {
+        if path == "" || path.endsWith("/") {
+            return self.listPrefix(container, path, recursive, includeExtensions, tolerateMissing, seen);
         }
 
-        // Ambiguous file-or-folder path: probe for an exact blob first.
-        blobs:BlobResult|error blob = self.blobClient->getBlob(container, normalized, ());
-        if blob is blobs:BlobResult {
-            // An explicitly named blob is always loaded, regardless of the extension filter.
-            // A deliberately named non-text blob is an error, unlike folder contents; a named
-            // scanned (image-only) PDF surfaces the descriptive error from `buildDocument`.
-            string? contentType = blob.properties?.blobContentType;
-            ai:TextDocument? document = check buildDocument(blob.blobContent, normalized, contentType,
-                    <decimal>blob.blobContent.length(), (), ());
-            if document is () {
-                return error ai:Error(string `Unsupported (non-text) file type for path '${rawPath}'`);
+        // Ambiguous file-or-folder path. The probe is a HEAD (`getBlobProperties`), not a GET:
+        // it settles existence and yields the metadata needed to classify the blob without
+        // downloading a single byte of a blob that may turn out to be an unsupported type.
+        blobs:ResponseHeaders|error properties = self.store->getBlobProperties(container, path);
+        if properties is blobs:ResponseHeaders {
+            // Already loaded through another source or path: skip before downloading it again.
+            if !markSeen(seen, container, path) {
+                return [];
             }
+            ai:TextDocument document = check self.loadNamedBlob(container, entryFromHeaders(path, properties));
             return [document];
         }
-        if !isNotFoundError(blob) {
-            return error ai:Error(
-                string `Failed to load path '${rawPath}' from container '${container}': ${blob.message()}`, blob);
+        if !isNotFoundError(properties) {
+            return error ai:Error(string `Failed to load path '${path}' from container ` +
+                string `'${container}': ${properties.message()}`, properties);
         }
         // No exact blob. If the path looks like a file, a missing blob is an error (unless
         // tolerated); otherwise treat it as a folder prefix and list it.
-        if getExtension(normalized) != "" {
+        if getExtension(path) != "" {
             if tolerateMissing {
                 return [];
             }
             return error ai:Error(
-                string `Failed to load path '${rawPath}' from container '${container}': blob not found`);
+                string `Failed to load path '${path}' from container '${container}': blob not found`);
         }
-        return self.listPrefix(container, normalized + "/", recursive, includeExtensions, tolerateMissing);
+        return self.listPrefix(container, path + "/", recursive, includeExtensions, tolerateMissing, seen);
     }
 
-    // Lists every blob under a prefix and converts the text/PDF/Office ones into documents.
-    // Under `recursive`, blobs at any depth are included; otherwise only those directly under
-    // the prefix. Unsupported blobs (and scanned image-only PDFs) are skipped with a warning
-    // (never an error inside a listing).
+    // Loads a single explicitly named blob. Unlike a blob discovered in a prefix listing, a
+    // deliberately named non-text blob is an ERROR (typo/intent detection), not a silent skip —
+    // and so is a named scanned (image-only) PDF, whose descriptive extraction error is
+    // surfaced to the caller.
+    //
+    // The extension filter is deliberately not applied: naming a blob expresses intent.
+    private isolated function loadNamedBlob(string container, BlobEntry entry)
+            returns ai:TextDocument|ai:Error {
+        DocumentKind kind = classify(entry.name, entry.contentType);
+        if !isSupported(kind) {
+            return error ai:Error(string `Unsupported (non-text) file type for path '${entry.name}' ` +
+                string `in container '${container}' (content type '${entry.contentType ?: "unknown"}')`);
+        }
+        return self.fetchAndBuild(container, entry, kind);
+    }
+
+    // Lists every blob under a prefix and converts the supported ones into documents. Under
+    // `recursive`, blobs at any depth are included; otherwise only those directly under the
+    // prefix.
+    //
+    // Every per-blob failure inside a listing is skipped with a logged warning, never
+    // propagated: one unreadable blob must not discard the documents already collected, nor
+    // abandon the rest of the container. A single non-UTF-8 `.txt`, one corrupt PDF, or one
+    // 403 on one blob would otherwise throw away an entire bulk ingestion.
+    //
+    // An explicitly named blob (`loadNamedBlob`) still errors — naming a blob expresses intent,
+    // so failing to load it is a mistake worth reporting rather than a silent skip.
     private isolated function listPrefix(string container, string prefix, boolean recursive,
-            string[]? includeExtensions, boolean tolerateMissing) returns ai:Document[]|ai:Error {
+            string[]? includeExtensions, boolean tolerateMissing, map<boolean> seen)
+            returns ai:Document[]|ai:Error {
         blobs:Blob[]|error blobList = self.listAllBlobs(container, prefix);
         if blobList is error {
             if tolerateMissing && isNotFoundError(blobList) {
@@ -152,6 +269,7 @@ public isolated class TextDataLoader {
         }
 
         ai:Document[] documents = [];
+        int skipped = 0;
         foreach blobs:Blob blob in blobList {
             BlobEntry entry = toBlobEntry(blob);
             string name = entry.name;
@@ -166,24 +284,57 @@ public isolated class TextDataLoader {
             if !matchesExtensionFilter(name, includeExtensions) {
                 continue;
             }
-            ai:TextDocument?|ai:Error document = self.toDocument(container, entry);
+            // ⬆️ UPSTREAM (see `isAddressableBlobName`): the connector cannot build a valid
+            // request path for a name containing `#`, `%`, or non-ASCII. Naming the real
+            // problem here beats letting it surface as an opaque 400, or — for `#` — as a
+            // successful download of the WRONG blob, which no error would ever reveal.
+            if !isAddressableBlobName(name) {
+                log:printWarn("Skipping an Azure Blob Storage file whose name cannot be addressed " +
+                        "by the connector: names containing '#', '%' or non-ASCII characters are " +
+                        "not percent-encoded in the request path",
+                        fileName = name, container = container);
+                skipped += 1;
+                continue;
+            }
+            // Already loaded through an overlapping source or path. Checked before the download,
+            // so a duplicate costs nothing rather than being fetched and then discarded.
+            if !markSeen(seen, container, name) {
+                continue;
+            }
+            // Classified from the LISTING metadata, before any download: Azure reports a real
+            // `Content-Type` per blob, so an image or an archive is skipped without spending
+            // the bandwidth to fetch it first.
+            DocumentKind kind = classify(name, entry.contentType);
+            if !isSupported(kind) {
+                log:printWarn("Skipping a non-text Azure Blob Storage file", fileName = name,
+                        container = container, contentType = entry.contentType ?: "unknown");
+                skipped += 1;
+                continue;
+            }
+            ai:TextDocument|ai:Error document = self.fetchAndBuild(container, entry, kind);
             if document is ai:Error {
-                // A scanned (image-only) PDF has no text to extract; inside a listing it is
-                // skipped like other non-text content rather than aborting the whole walk.
-                // (An explicitly named scanned PDF still surfaces this error to the caller.)
                 if isScannedPdfError(document) {
                     log:printWarn("Skipping a scanned (image-only) PDF: it has no extractable " +
                             "text layer, and OCR is not supported", fileName = name, container = container);
-                    continue;
+                } else {
+                    // Any reason at all: content that will not decode, a corrupt Office file, a
+                    // blob above the response-size cap, a 403 on this one blob. The walk
+                    // continues either way.
+                    log:printWarn("Skipping an Azure Blob Storage file that could not be loaded",
+                            fileName = name, container = container, reason = document.message());
                 }
-                return document;
+                skipped += 1;
+                continue;
             }
-            if document is ai:TextDocument {
-                documents.push(document);
-            } else {
-                log:printWarn("Skipping a non-text Azure Blob Storage file",
-                        fileName = name, container = container);
-            }
+            documents.push(document);
+        }
+
+        // A prefix where everything was skipped otherwise looks identical to an empty one: the
+        // caller gets an empty array and would have to read the logs line by line to tell the
+        // difference. Summarise it once instead.
+        if skipped > 0 {
+            log:printWarn("Some Azure Blob Storage files under this prefix were skipped",
+                    container = container, prefix = prefix, loaded = documents.length(), skipped = skipped);
         }
         return documents;
     }
@@ -193,10 +344,14 @@ public isolated class TextDataLoader {
     private isolated function listAllBlobs(string container, string prefix) returns blobs:Blob[]|error {
         blobs:Blob[] all = [];
         string? marker = ();
+        int pages = 0;
         while true {
             string? prefixArg = prefix == "" ? () : prefix;
-            blobs:ListBlobResult result = check self.blobClient->listBlobs(container, (), marker, prefixArg);
+            blobs:ListBlobResult result = check self.store->listBlobs(container, marker, prefixArg);
             all.push(...result.blobList);
+            pages += 1;
+            check guardPagination(result.nextMarker, marker,
+                    pages, string `the listing of prefix '${prefix}' in container '${container}'`);
             if result.nextMarker == "" {
                 break;
             }
@@ -205,22 +360,67 @@ public isolated class TextDataLoader {
         return all;
     }
 
-    // Downloads a blob's content and converts it into an `ai:TextDocument`, returning `()`
-    // when the blob cannot be represented as text (the caller skips it). Metadata from the
-    // listing entry is preferred; content type and size fall back to the download response.
-    private isolated function toDocument(string container, BlobEntry entry)
-            returns ai:TextDocument?|ai:Error {
-        blobs:BlobResult|error blob = self.blobClient->getBlob(container, entry.name, ());
+    // Downloads a blob's content and converts it into an `ai:TextDocument`. Only ever called
+    // for a supported kind (see `isSupported`), so the download is never wasted on a blob that
+    // cannot become text. Metadata from the listing (or HEAD) entry is preferred; content type
+    // and size fall back to the download response.
+    private isolated function fetchAndBuild(string container, BlobEntry entry, DocumentKind kind)
+            returns ai:TextDocument|ai:Error {
+        blobs:BlobResult|error blob = self.store->getBlob(container, entry.name);
         if blob is error {
-            return error ai:Error(
-                string `Failed to download blob '${entry.name}' from container '${container}': ${blob.message()}`,
-                blob);
+            return error ai:Error(string `Failed to download blob '${entry.name}' from container ` +
+                string `'${container}': ${blob.message()}`, blob);
         }
-        string? contentType = entry.contentType ?: blob.properties?.blobContentType;
-        decimal? contentLength = entry.contentLength ?: <decimal>blob.blobContent.length();
-        return buildDocument(blob.blobContent, entry.name, contentType, contentLength,
-                entry.creationTime, entry.lastModified);
+        BlobEntry enriched = {
+            name: entry.name,
+            contentType: entry.contentType ?: blob.properties?.blobContentType,
+            contentLength: entry.contentLength ?: <decimal>blob.blobContent.length(),
+            creationTime: entry.creationTime,
+            lastModified: entry.lastModified
+        };
+        return buildDocument(blob.blobContent, kind, buildMetadata(enriched, container));
     }
+}
+
+// The hard ceiling on how many pages a single listing may walk. At Azure's default of 5000
+// blobs per page this is 50 million blobs — far beyond any load that would finish anyway, so
+// reaching it means the cursor is not advancing rather than that the container is genuinely
+// that large.
+const int MAX_LISTING_PAGES = 10000;
+
+// Guards a `NextMarker` walk against never terminating.
+//
+// Azure ends a listing with an empty `NextMarker`. A service or proxy that echoed the previous
+// marker back instead would spin `while true` forever, holding every page fetched so far in
+// memory. Both conditions are reported as errors rather than quietly breaking out: a truncated
+// listing that looks like a successful load is worse than a failed one, because the missing
+// blobs silently never reach the caller's index.
+isolated function guardPagination(string nextMarker, string? previousMarker, int pages,
+        string description) returns ai:Error? {
+    if nextMarker != "" && previousMarker is string && nextMarker == previousMarker {
+        return error ai:Error(string `Pagination of ${description} is not advancing: the ` +
+            string `service returned the same marker twice ('${nextMarker}')`);
+    }
+    if pages >= MAX_LISTING_PAGES {
+        return error ai:Error(string `Pagination of ${description} exceeded ` +
+            string `${MAX_LISTING_PAGES} pages and was abandoned`);
+    }
+    return ();
+}
+
+// Records a blob as loaded, returning `false` when it had already been seen.
+//
+// The key is `container + "/" + blobName`, which is unique across a storage account. Sources
+// overlap easily — `paths: ["/", "/reports"]`, the same container listed twice, or a container
+// reached both directly and through `"*"` — and without this the same blob becomes two
+// identical documents, duplicating it in whatever index the caller builds.
+isolated function markSeen(map<boolean> seen, string container, string blobName) returns boolean {
+    string key = container + "/" + blobName;
+    if seen.hasKey(key) {
+        return false;
+    }
+    seen[key] = true;
+    return true;
 }
 
 // Builds a normalized `BlobEntry` from a connector `Blob`, reading the metadata this loader
@@ -234,6 +434,32 @@ isolated function toBlobEntry(blobs:Blob blob) returns BlobEntry {
         creationTime: propString(properties, "Creation-Time"),
         lastModified: propString(properties, "Last-Modified")
     };
+}
+
+// Builds a `BlobEntry` from the response headers of a `getBlobProperties` (HEAD) probe, so an
+// explicitly named blob is classified from the same shape as a listed one. Azure returns the
+// creation time as the `x-ms-creation-time` header rather than the `Creation-Time` name used
+// in the List Blobs XML.
+isolated function entryFromHeaders(string blobName, blobs:ResponseHeaders headers) returns BlobEntry => {
+    name: blobName,
+    contentType: headerValue(headers, "Content-Type"),
+    contentLength: decimalFromString(headerValue(headers, "Content-Length")),
+    creationTime: headerValue(headers, "x-ms-creation-time"),
+    lastModified: headerValue(headers, "Last-Modified")
+};
+
+// Reads a header case-insensitively out of the connector's open `ResponseHeaders` record,
+// returning `()` for a missing or blank value. HTTP header names are case-insensitive and
+// nothing in the connector normalizes their casing, so an exact-key lookup is not safe.
+isolated function headerValue(blobs:ResponseHeaders headers, string name) returns string? {
+    map<anydata> entries = headers;
+    string wanted = name.toLowerAscii();
+    foreach var [key, value] in entries.entries() {
+        if key.toLowerAscii() == wanted && value is string && value.trim() != "" {
+            return value;
+        }
+    }
+    return ();
 }
 
 // Reports whether a connector error represents a 404 (blob or container not found), used to
