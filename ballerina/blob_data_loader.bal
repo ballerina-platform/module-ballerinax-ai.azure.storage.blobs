@@ -284,7 +284,7 @@ isolated class BlobLoader {
             if !matchesExtensionFilter(name, includeExtensions) {
                 continue;
             }
-            // ⬆️ UPSTREAM (see `isAddressableBlobName`): the connector cannot build a valid
+            // UPSTREAM (see `isAddressableBlobName`): the connector cannot build a valid
             // request path for a name containing `#`, `%`, or non-ASCII. Naming the real
             // problem here beats letting it surface as an opaque 400, or — for `#` — as a
             // successful download of the WRONG blob, which no error would ever reveal.
@@ -467,14 +467,32 @@ isolated function headerValue(blobs:ResponseHeaders headers, string name) return
 isolated function isNotFoundError(error e) returns boolean {
     if e is blobs:ServerError {
         blobs:ServerErrorDetail detail = e.detail();
-        if detail.httpStatus == 404 {
-            return true;
-        }
-        if detail.errorCode.toLowerAscii().includes("notfound") {
+        if detail.httpStatus == 404 || detail.errorCode.toLowerAscii().includes("notfound") {
             return true;
         }
     }
-    string message = e.message().toLowerAscii();
-    return message.includes("not found") || message.includes("status code '404'")
-            || message.includes("status: 404") || message.includes("notfound");
+    // A 404 also arrives as an untyped error, whose own message is only the fixed wrapper
+    // "(ballerinax/azure-storage-service)BlobError" — the status text ("Status Code: 404 The
+    // specified blob does not exist.") sits in the `message` field of its detail, so both that
+    // and the cause chain have to be inspected.
+    if isNotFoundText(e.message()) {
+        return true;
+    }
+    anydata|readonly detailMessage = e.detail()["message"];
+    if detailMessage is string && isNotFoundText(detailMessage) {
+        return true;
+    }
+    error? cause = e.cause();
+    return cause is error && isNotFoundError(cause);
+}
+
+// Reports whether connector error text denotes a 404, across the wordings the connector and
+// the Azure REST API use. Deliberately avoids matching a bare "404", which would misfire on
+// a blob whose own name contains it.
+isolated function isNotFoundText(string text) returns boolean {
+    string message = text.toLowerAscii();
+    return message.includes("not found") || message.includes("notfound")
+            || message.includes("does not exist")
+            || message.includes("status code: 404") || message.includes("status code '404'")
+            || message.includes("status: 404");
 }

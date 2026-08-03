@@ -122,7 +122,12 @@ isolated client class MockBlobStore {
             returns blobs:ResponseHeaders|error {
         MockBlob? blob = self.find(container, blobName);
         if blob is () {
-            return blobNotFound(container, blobName);
+            // NOT a `blobs:ServerError`. `getBlobProperties` is an HTTP HEAD, so the 404 has no
+            // XML body, and the connector's `handleResponse` falls to its untyped branch —
+            // a bare `error` whose message is a fixed constant, with the status text buried in
+            // the detail. Modelling this faithfully is the whole point: a friendlier fake here
+            // hid a real defect in `isNotFoundError`.
+            return headNotFound(container, blobName);
         }
         blobs:ResponseHeaders headers = emptyHeaders();
         headers["Content-Length"] = blob.content.length().toString();
@@ -228,6 +233,19 @@ isolated function containerNotFound(string container) returns blobs:ServerError 
     error("The specified container does not exist.", httpStatus = 404,
             errorCode = "ContainerNotFound",
             message = string `The specified container '${container}' does not exist.`);
+
+// The 404 the connector produces for a HEAD request (`getBlobProperties`). Azure returns no
+// body on a HEAD, so `handleResponse` cannot build a typed `ServerError` and instead returns
+// `error(AZURE_BLOB_ERROR_CODE, message = "Status Code: 404 <reason>")` — meaning `message()`
+// is the fixed constant below and the status text is only reachable through `detail()`.
+isolated function headNotFound(string container, string blobName) returns error =>
+    error(AZURE_BLOB_ERROR_CODE,
+            message = string `Status Code: 404 The specified blob does not exist. ` +
+                string `(container '${container}', blob '${blobName}')`);
+
+// Mirrors `AZURE_BLOB_ERROR_CODE` in the connector: the literal value its untyped errors carry
+// as their message, which is why matching on `message()` alone never sees a status code.
+const string AZURE_BLOB_ERROR_CODE = "(ballerinax/azure-storage-service)BlobError";
 
 isolated function blobNotFound(string container, string blobName) returns blobs:ServerError =>
     error("The specified blob does not exist.", httpStatus = 404, errorCode = "BlobNotFound",

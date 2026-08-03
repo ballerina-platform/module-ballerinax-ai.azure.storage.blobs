@@ -269,6 +269,36 @@ isolated function testIsNotFoundErrorFromMessageText() {
     test:assertTrue(isNotFoundError(error("request failed with status code '404'")));
 }
 
+// REGRESSION: `getBlobProperties` is an HTTP HEAD, so its 404 carries no XML body and the
+// connector cannot build a typed `ServerError`. It returns a bare `error` whose message is the
+// fixed constant `(ballerinax/azure-storage-service)BlobError`, with the status text only in
+// `detail()["message"]`. Matching on `message()` alone saw none of it, so the file-vs-folder
+// probe treated every missing blob as a hard failure instead of falling back to a prefix.
+
+@test:Config {}
+isolated function testIsNotFoundErrorReadsTheUntypedHeadError() {
+    error headError = error(AZURE_BLOB_ERROR_CODE,
+            message = "Status Code: 404 The specified blob does not exist.");
+    test:assertEquals(headError.message(), AZURE_BLOB_ERROR_CODE,
+            "The connector's own message carries no status information at all");
+    test:assertTrue(isNotFoundError(headError), "The 404 must be found in the error detail");
+}
+
+@test:Config {}
+isolated function testIsNotFoundErrorReadsAWrappedHeadError() {
+    error headError = error(AZURE_BLOB_ERROR_CODE,
+            message = "Status Code: 404 The specified blob does not exist.");
+    test:assertTrue(isNotFoundError(error("Failed to probe the blob", headError)),
+            "A wrapped 404 is still recognised through the cause chain");
+}
+
+@test:Config {}
+isolated function testIsNotFoundErrorIgnoresAnIncidental404InABlobName() {
+    // Matching a bare "404" would misfire here; the wordings matched are all phrases.
+    test:assertFalse(isNotFoundError(error("Failed to download blob 'report-404.pdf'")),
+            "A blob name containing 404 is not a not-found");
+}
+
 @test:Config {}
 isolated function testIsNotFoundErrorFalseForOtherErrors() {
     test:assertFalse(isNotFoundError(error("internal server error")));
