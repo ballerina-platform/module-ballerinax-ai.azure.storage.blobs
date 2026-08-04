@@ -84,6 +84,29 @@ isolated function testInitAcceptsASourceThatSelectsNothing() returns error? {
     TextDataLoader _ = check new (TEST_CONFIG, [{container: "documents", paths: []}]);
 }
 
+@test:Config {
+    dataProvider: unaddressablePaths
+}
+isolated function testInitRejectsAnUnaddressablePath(string path) {
+    // UPSTREAM (see `isAddressableBlobName`): the connector percent-encodes neither the
+    // request path nor the `prefix` query parameter, so such a path is rejected here rather
+    // than as an opaque 400 — or, for `#` and `?`, a silent hit on a DIFFERENT blob.
+    TextDataLoader|ai:Error loader = new (TEST_CONFIG, [{container: "documents", paths: [path]}]);
+    if loader is ai:Error {
+        test:assertTrue(loader.message().includes("cannot be used"), loader.message());
+    } else {
+        test:assertFail(string `Expected an error for the unaddressable path '${path}'`);
+    }
+}
+
+// `#` and `?` only: both truncate the request path, so they are the cases where the request
+// SUCCEEDS against the wrong blob. The full character set is covered against `resolveSources`
+// in `load_test.bal`; what this adds is that the rejection reaches the public constructor.
+isolated function unaddressablePaths() returns string[][] => [
+    ["reports/q1#draft.pdf"],
+    ["reports/q1?draft.pdf"]
+];
+
 // ---- normalizeBlobPath -------------------------------------------------------
 
 @test:Config {}
@@ -267,6 +290,27 @@ isolated function testIsNotFoundErrorFromErrorCode() {
 isolated function testIsNotFoundErrorFromMessageText() {
     test:assertTrue(isNotFoundError(error("Resource not found")));
     test:assertTrue(isNotFoundError(error("request failed with status code '404'")));
+}
+
+// A typed `ServerError` carries the status, so it settles the question by itself — the message
+// heuristics below it apply only to errors that have no status at all. Without this precedence
+// a 500 whose body happens to mention "not found" reads as a missing blob, and under
+// `tolerateMissing` a container that is genuinely erroring is silently skipped instead.
+@test:Config {}
+isolated function testIsNotFoundErrorIgnoresMessageTextWhenTheStatusSaysOtherwise() {
+    blobs:ServerError err = error("failed",
+            httpStatus = 500, errorCode = "InternalError",
+            message = "The specified blob was not found in the backing store.");
+    test:assertFalse(isNotFoundError(err),
+            "A 500 is not a not-found, whatever its message text says");
+}
+
+@test:Config {}
+isolated function testIsNotFoundErrorIgnoresACauseWhenTheStatusSaysOtherwise() {
+    blobs:ServerError err = error("failed", error("Status Code: 404 not found"),
+            httpStatus = 503, errorCode = "ServerBusy", message = "The server is busy.");
+    test:assertFalse(isNotFoundError(err),
+            "A typed status is authoritative over anything in the cause chain");
 }
 
 // REGRESSION: `getBlobProperties` is an HTTP HEAD, so its 404 carries no XML body and the

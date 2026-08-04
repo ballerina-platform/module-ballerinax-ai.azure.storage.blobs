@@ -33,6 +33,22 @@ isolated function testGetExtensionNoDot() {
     test:assertEquals(getExtension("reports/2026/q1"), "", "A path with no dot yields empty");
 }
 
+// REGRESSION: the search used to run over the whole path, so a dot in an ANCESTOR folder was
+// read as the extension of a file that has none — `"v1.2/notes"` answered `"2/notes"`. That
+// answer reaches `loadPath`, where a non-empty extension means "this path names a file", so a
+// dotted folder name was reported as `blob not found` instead of being listed as a prefix.
+@test:Config {}
+isolated function testGetExtensionIgnoresDotsInAncestorFolders() {
+    test:assertEquals(getExtension("v1.2/notes"), "",
+            "A dot in a parent folder is not the file's extension");
+    test:assertEquals(getExtension("v1.2"), "2",
+            "A dot in the last segment still is one, even at the top level");
+    test:assertEquals(getExtension("specs/v1.2/api.md"), "md",
+            "The last segment wins over any dotted ancestor");
+    test:assertEquals(getExtension("release/2026.Q1/CHANGELOG"), "",
+            "A dotted folder above an extension-less file yields empty");
+}
+
 // ---- classify ----------------------------------------------------------------
 
 @test:Config {}
@@ -181,6 +197,32 @@ isolated function testDecodeTextHandlesUtf16WithBom() returns error? {
     test:assertEquals(check decodeText(utf16be, ""), "hi");
 }
 
+// REGRESSION: the UTF-32LE BOM is `FF FE 00 00`, whose first two bytes ARE the whole UTF-16LE
+// BOM. Testing UTF-16 first therefore claimed UTF-32 content, skipped only 2 bytes of the mark
+// and decoded the rest as UTF-16 — yielding text interleaved with NULs, and a leading `U+0000`
+// from the remainder of the BOM itself. The four-byte marks have to be tested first.
+@test:Config {}
+isolated function testDecodeTextHandlesUtf32WithBom() returns error? {
+    // "hi" in UTF-32LE, BOM first.
+    byte[] utf32le = [0xFF, 0xFE, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x69, 0x00, 0x00, 0x00];
+    string decodedLe = check decodeText(utf32le, "");
+    test:assertEquals(decodedLe, "hi", "A UTF-32LE BOM must not be read as UTF-16LE");
+    test:assertEquals(decodedLe.toCodePointInts(), [0x68, 0x69],
+            "No NUL and no leftover BOM code point survives a correctly sized skip");
+
+    byte[] utf32be = [0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x69];
+    test:assertEquals(check decodeText(utf32be, ""), "hi");
+}
+
+@test:Config {}
+isolated function testDecodeTextStillReadsUtf16AfterTheUtf32Check() returns error? {
+    // The UTF-32 checks must not shadow a genuine UTF-16LE document whose first code unit
+    // happens to carry a NUL byte.
+    byte[] utf16le = [0xFF, 0xFE, 0x68, 0x00, 0x00, 0x00];
+    test:assertEquals((check decodeText(utf16le, "")).toCodePointInts(), [0x68, 0x00],
+            "FF FE not followed by 00 00 is still UTF-16LE");
+}
+
 @test:Config {}
 isolated function testDecodeTextHonoursADeclaredCharset() returns error? {
     // 0xE9 is `é` in windows-1252 / latin-1, and invalid as standalone UTF-8.
@@ -248,8 +290,48 @@ isolated function testHtmlToTextKeepsBlockBoundariesApart() {
 
 @test:Config {}
 isolated function testHtmlToTextResolvesAmpersandLast() {
-    // Resolving &amp; first would turn "&amp;lt;" into "<".
+    // A single left-to-right pass never rescans what a replacement produced, so "&amp;lt;"
+    // comes out as the literal "&lt;" rather than being resolved twice into "<".
     test:assertEquals(htmlToText("<p>&amp;lt;</p>"), "&lt;");
+}
+
+// The named-reference table used to hold eight entries, so anything outside it — `&copy;`,
+// `&eacute;`, `&deg;`, every accented Latin-1 letter — reached the document body verbatim. That
+// is not merely cosmetic: it puts a token that is not a word into every embedding built from
+// the document.
+@test:Config {}
+isolated function testHtmlToTextResolvesTheStandardNamedReferences() {
+    test:assertEquals(htmlToText("<p>&copy; 2026</p>"), "© 2026");
+    test:assertEquals(htmlToText("<p>Caf&eacute;</p>"), "Café");
+    test:assertEquals(htmlToText("<p>20&deg;C &plusmn;1</p>"), "20°C ±1");
+    test:assertEquals(htmlToText("<p>&frac12; &times; &pound;5</p>"), "½ × £5");
+    test:assertEquals(htmlToText("<p>&alpha;&beta;&Omega;</p>"), "αβΩ");
+    test:assertEquals(htmlToText("<p>&trade; &bull; &rarr; &ne;</p>"), "™ • → ≠");
+    test:assertEquals(htmlToText("<p>&ldquo;quoted&rdquo;</p>"), "“quoted”");
+}
+
+@test:Config {}
+isolated function testHtmlToTextLeavesAnUnknownReferenceAlone() {
+    // The source text is a better answer than a guess.
+    test:assertEquals(htmlToText("<p>&notarealentity; x</p>"), "&notarealentity; x");
+    test:assertEquals(htmlToText("<p>&#xZZ; y</p>"), "&#xZZ; y");
+}
+
+@test:Config {}
+isolated function testHtmlToTextFoldsNonBreakingSpaces() {
+    // U+00A0 is whitespace to every reader of the body, and leaving it in place would defeat
+    // the whitespace collapsing applied right after entity resolution.
+    test:assertEquals(htmlToText("<p>one&nbsp;&nbsp;two</p>"), "one two");
+}
+
+@test:Config {}
+isolated function testHtmlToTextTerminatesOnAnUnclosedScriptTag() {
+    // The script/style body is length-bounded, so an unclosed start tag cannot make the engine
+    // rescan to the end of the input for every one of them (quadratic on the load thread).
+    string rendered = htmlToText(
+            "<p>before</p><script><script><script><script><script><p>after</p>");
+    test:assertTrue(rendered.includes("before"), rendered);
+    test:assertTrue(rendered.includes("after"), rendered);
 }
 
 @test:Config {}
@@ -378,6 +460,37 @@ isolated function testExtractTextLegacyOfficeByMimeTypeOnly() returns error? {
     // Same as above for the legacy OLE2 MIME family (OfficeParser).
     string text = check extractText(XLS_BYTES, "noext-spreadsheet", "application/vnd.ms-excel");
     test:assertTrue(text.includes(XLS_TEXT), text);
+}
+
+// REGRESSION: parser selection used to consult the file EXTENSION first, while `classify`
+// treats the Content-Type as authoritative and falls back to the extension. When the two
+// disagree the layers must not: a `.docx` name on a blob Azure reports as a PDF is classified
+// from its MIME type, so it has to be parsed as one too.
+@test:Config {}
+isolated function testExtractTextPrefersTheMimeTypeOverTheExtension() returns error? {
+    string text = check extractText(PDF_BYTES, "misnamed.docx", "application/pdf");
+    test:assertTrue(text.includes(PDF_TEXT),
+            string `A PDF named .docx must be parsed as the PDF its MIME type declares: ${text}`);
+
+    string office = check extractText(DOCX_BYTES, "misnamed.pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    test:assertTrue(office.includes(DOCX_TEXT), office);
+}
+
+// Azure echoes back whatever Content-Type was set at upload, parameters and all, and the
+// Ballerina `classify` strips them before matching. Parser selection has to strip them too, or
+// an extension-less blob typed `...wordprocessingml.document; charset=binary` falls past every
+// Office match and is handed to the PDF parser.
+@test:Config {}
+isolated function testExtractTextIgnoresMimeParameters() returns error? {
+    string text = check extractText(DOCX_BYTES, "noext-word-doc",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document; charset=binary");
+    test:assertTrue(text.includes(DOCX_TEXT), text);
+
+    string legacy = check extractText(XLS_BYTES, "noext-spreadsheet",
+            "  APPLICATION/VND.MS-EXCEL ; charset=binary");
+    test:assertTrue(legacy.includes(XLS_TEXT),
+            string `A media type is matched case-insensitively and untrimmed: ${legacy}`);
 }
 
 @test:Config {}

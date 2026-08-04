@@ -54,6 +54,21 @@ final http:ResponseLimitConfigs & readonly DEFAULT_RESPONSE_LIMITS = {
 // unbounded response body. Both are filled in here when the caller supplied neither — an
 // explicit value always wins, including one that deliberately disables retrying.
 isolated function newBlobClient(blobs:ConnectionConfig config) returns blobs:BlobClient|ai:Error {
+    blobs:BlobClient|error blobClient = new (applyConnectionDefaults(config));
+    if blobClient is error {
+        return error ai:Error(
+            string `Failed to initialize the Azure Blob Storage client: ${blobClient.message()}`, blobClient);
+    }
+    return blobClient;
+}
+
+// Returns the config the client is actually constructed from: the caller's, with `retryConfig`
+// and `responseLimits` filled in only where the caller left them unset.
+//
+// Kept separate from `newBlobClient` so the defaulting is directly observable. Asserting on the
+// caller's own record proves only that it was not mutated — it says nothing about what was
+// handed to the connector, so a bug that overwrote an explicit policy would pass unnoticed.
+isolated function applyConnectionDefaults(blobs:ConnectionConfig config) returns blobs:ConnectionConfig {
     // A spread copy rather than `clone()`, which returns a readonly value unchanged and would
     // make the defaulting below fail on an immutable caller config. This copy is always mutable,
     // and the caller's own record is never touched.
@@ -64,12 +79,7 @@ isolated function newBlobClient(blobs:ConnectionConfig config) returns blobs:Blo
     if effective.responseLimits is () {
         effective.responseLimits = DEFAULT_RESPONSE_LIMITS;
     }
-    blobs:BlobClient|error blobClient = new (effective);
-    if blobClient is error {
-        return error ai:Error(
-            string `Failed to initialize the Azure Blob Storage client: ${blobClient.message()}`, blobClient);
-    }
-    return blobClient;
+    return effective;
 }
 
 // The four Azure Blob operations this loader performs, named as an object type so the whole

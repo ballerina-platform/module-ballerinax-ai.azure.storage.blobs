@@ -1,5 +1,5 @@
 ## Purpose
-> Describe the problems, issues, or needs driving this feature/fix and include links to related issues in the following format: Resolves issue1, issue2, etc.
+> Describe the problems, issues, or needs driving this feature/fix and include links to related issues in the following format: Resolves #123, #456, etc.
 
 ## Goals
 > Describe the solutions that this feature/fix will introduce to resolve the problems described above
@@ -32,7 +32,7 @@
    > Details about the test cases and coverage
 
 ## Security checks
- - Followed secure coding standards in http://wso2.com/technical-reports/wso2-secure-engineering-guidelines? yes/no
+ - Followed secure coding standards in https://wso2.com/technical-reports/wso2-secure-engineering-guidelines? yes/no
  - Ran FindSecurityBugs plugin and verified report? yes/no
  - Confirmed that this PR doesn't commit any keys, passwords, tokens, usernames, or other secrets? yes/no
 

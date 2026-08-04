@@ -21,6 +21,7 @@ import io.ballerina.runtime.api.creators.ErrorCreator;
 import io.ballerina.runtime.api.utils.StringUtils;
 import io.ballerina.runtime.api.values.BArray;
 import io.ballerina.runtime.api.values.BString;
+import org.apache.tika.exception.WriteLimitReachedException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -67,8 +68,25 @@ import java.util.Set;
  */
 public final class TextExtractor {
 
-    // A BodyContentHandler write limit of -1 means "no limit" on extracted content size.
-    private static final int UNLIMITED_CONTENT_SIZE = -1;
+    /**
+     * The ceiling on extracted text, in characters, per document.
+     *
+     * <p>An unlimited handler ({@code -1}) makes the extracted text unbounded independently of
+     * how large the blob was: compressed formats expand, and an OOXML file well under the
+     * loader's 100 MB download cap can hold far more text than that, on top of the bytes the
+     * loader is already holding. 50 million characters is roughly 100 MB of {@code char} data
+     * and some tens of thousands of pages of prose — comfortably beyond any real document, while
+     * still bounding a decompression bomb.
+     *
+     * <p>Configurable via the {@code MAX_EXTRACTED_CHARACTERS_PROPERTY} system property, for the
+     * caller who genuinely has a larger document.
+     */
+    private static final int DEFAULT_MAX_EXTRACTED_CHARACTERS = 50_000_000;
+
+    static final String MAX_EXTRACTED_CHARACTERS_PROPERTY =
+            "ballerina.ai.azure.storage.blobs.maxExtractedCharacters";
+
+    private static final int MAX_EXTRACTED_CHARACTERS = resolveMaxExtractedCharacters();
 
     /**
      * The error message returned for a PDF that parses successfully but yields no text.
@@ -96,6 +114,12 @@ public final class TextExtractor {
             "application/vnd.ms-excel",
             "application/vnd.ms-powerpoint");
 
+    // PDF MIME types, parsed by PDFParser. `application/x-pdf` is a legacy spelling still seen
+    // on blobs uploaded by older tooling.
+    private static final Set<String> PDF_MIME_TYPES = Set.of(
+            "application/pdf",
+            "application/x-pdf");
+
     private TextExtractor() {
     }
 
@@ -114,7 +138,7 @@ public final class TextExtractor {
         byte[] bytes = content.getBytes();
         try (InputStream stream = new ByteArrayInputStream(bytes)) {
             Parser parser = selectParser(fileName.getValue(), mimeType.getValue());
-            BodyContentHandler handler = new BodyContentHandler(UNLIMITED_CONTENT_SIZE);
+            BodyContentHandler handler = new BodyContentHandler(MAX_EXTRACTED_CHARACTERS);
             Metadata metadata = new Metadata();
             metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, fileName.getValue());
             ParseContext context = new ParseContext();
@@ -134,6 +158,16 @@ public final class TextExtractor {
             }
             return StringUtils.fromString(text);
         } catch (Exception e) {
+            // The write limit is reported as an exception out of the handler, so it has to be
+            // named here or it would surface as an opaque parse failure. It fails only THIS
+            // blob: a prefix listing logs it and carries on, exactly as with any other per-blob
+            // error, rather than losing the documents already collected.
+            if (WriteLimitReachedException.isWriteLimitReached(e)) {
+                return ErrorCreator.createError(StringUtils.fromString(
+                        "the extracted text exceeds the " + MAX_EXTRACTED_CHARACTERS
+                                + " character limit; raise the '" + MAX_EXTRACTED_CHARACTERS_PROPERTY
+                                + "' system property to extract documents this large"));
+            }
             String message = e.getMessage();
             return ErrorCreator.createError(StringUtils.fromString(
                     message != null ? message : e.getClass().getSimpleName()));
@@ -141,17 +175,50 @@ public final class TextExtractor {
     }
 
     /**
-     * Selects the Tika parser for a file from its extension, falling back to its MIME type.
+     * Reads the extracted-text ceiling from its system property, falling back to the default
+     * when it is unset or not a positive integer. A silent fallback is right here: a typo in a
+     * tuning property must not stop every document in the account from loading.
+     */
+    private static int resolveMaxExtractedCharacters() {
+        String configured = System.getProperty(MAX_EXTRACTED_CHARACTERS_PROPERTY);
+        if (configured == null) {
+            return DEFAULT_MAX_EXTRACTED_CHARACTERS;
+        }
+        try {
+            int limit = Integer.parseInt(configured.trim());
+            return limit > 0 ? limit : DEFAULT_MAX_EXTRACTED_CHARACTERS;
+        } catch (NumberFormatException e) {
+            return DEFAULT_MAX_EXTRACTED_CHARACTERS;
+        }
+    }
+
+    /**
+     * Selects the Tika parser for a file from its MIME type, falling back to its extension.
      * OOXML (.docx/.xlsx/.pptx) and legacy OLE2 (.doc/.xls/.ppt) Office formats use POI;
      * everything else this method is called with is a PDF (the caller only routes PDF/Office
      * here), which uses PDFBox.
      *
-     * <p>The MIME fallback matters on Azure Blob Storage: listings report a real
-     * {@code Content-Type}, so the Ballerina {@code classify} can deem an extension-less
-     * blob extractable from its MIME type alone — parser selection must honour the same
-     * signal or such a blob would be misrouted to the PDF parser.
+     * <p>The MIME type is consulted FIRST, because it is what the Ballerina {@code classify}
+     * treats as authoritative — the extension is its own fallback. Selecting on the extension
+     * first would disagree with that decision whenever the two conflict: {@code notes.docx}
+     * stored as {@code application/pdf} is classified from its MIME type, then parsed as OOXML,
+     * and fails.
+     *
+     * <p>The media type is normalized the same way {@code essenceOf} normalizes it on the
+     * Ballerina side. Azure echoes back whatever was set at upload, parameters and all
+     * ({@code ...wordprocessingml.document; charset=binary}), which no exact match would catch.
      */
     private static Parser selectParser(String fileName, String mimeType) {
+        String mime = essenceOf(mimeType);
+        if (OOXML_MIME_TYPES.contains(mime)) {
+            return new OOXMLParser();
+        }
+        if (OLE2_MIME_TYPES.contains(mime)) {
+            return new OfficeParser();
+        }
+        if (PDF_MIME_TYPES.contains(mime)) {
+            return new PDFParser();
+        }
         String name = fileName.toLowerCase(Locale.ROOT);
         if (name.endsWith(".docx") || name.endsWith(".xlsx") || name.endsWith(".pptx")) {
             return new OOXMLParser();
@@ -159,17 +226,17 @@ public final class TextExtractor {
         if (name.endsWith(".doc") || name.endsWith(".xls") || name.endsWith(".ppt")) {
             return new OfficeParser();
         }
-        if (name.endsWith(".pdf")) {
-            return new PDFParser();
-        }
-        String mime = mimeType.toLowerCase(Locale.ROOT);
-        if (OOXML_MIME_TYPES.contains(mime)) {
-            return new OOXMLParser();
-        }
-        if (OLE2_MIME_TYPES.contains(mime)) {
-            return new OfficeParser();
-        }
         return new PDFParser();
+    }
+
+    /**
+     * Reduces a Content-Type to its bare essence: parameters stripped, trimmed, lower-cased.
+     * Mirrors {@code essenceOf} in {@code utils.bal}, so both layers match on the same string.
+     */
+    private static String essenceOf(String mimeType) {
+        int separator = mimeType.indexOf(';');
+        String essence = separator < 0 ? mimeType : mimeType.substring(0, separator);
+        return essence.trim().toLowerCase(Locale.ROOT);
     }
 
     /**

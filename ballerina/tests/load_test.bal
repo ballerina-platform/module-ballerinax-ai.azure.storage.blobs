@@ -113,6 +113,25 @@ isolated function testFolderMarkerBlobsAreSkipped() returns error? {
             "A folder-marker blob is skipped before it is downloaded");
 }
 
+// REGRESSION: the file-vs-folder probe asks `getExtension` whether a path "looks like a file",
+// and that search used to run over the WHOLE path. A folder with a dot in its name therefore
+// lent its dot to every extension-less path beneath it — `specs/v1.2/notes` answered
+// `"2/notes"` — so the path was judged a file, its 404 was final, and a folder that genuinely
+// exists came back as `blob not found`.
+@test:Config {}
+isolated function testAPathUnderADottedFolderIsStillResolvedAsAFolder() returns error? {
+    MockBlob[] dotted = [
+        {container: "docs", name: "specs/v1.2/notes/intro.txt", contentType: "text/plain",
+            content: "intro".toBytes()},
+        {container: "docs", name: "specs/v1.2/notes/detail.txt", contentType: "text/plain",
+            content: "detail".toBytes()}
+    ];
+    MockBlobStore store = new (dotted);
+    ai:Document[] documents = check loadAll(store, [{container: "docs", paths: ["/specs/v1.2/notes"]}]);
+    assertLoaded(documents, ["specs/v1.2/notes/intro.txt", "specs/v1.2/notes/detail.txt"],
+            "A dot in an ancestor folder must not make an extension-less path look like a file");
+}
+
 // ---- explicitly named blobs --------------------------------------------------
 
 @test:Config {}
@@ -440,10 +459,22 @@ isolated function testAStuckPaginationCursorIsReportedNotLoopedOn() {
 
 @test:Config {}
 isolated function testAStuckContainerCursorIsReported() {
-    MockBlobStore store = new (sampleBlobs(), pageSize = 1, stickyMarker = true);
+    // The CONTAINER listing has its own cursor and its own guard, so the fixture must span more
+    // containers than `pageSize`: with a single container that listing returns one page and an
+    // empty marker, and the walk ends before the guard ever compares two markers — leaving the
+    // blob listing of that one container to raise the error this test then credits to the
+    // container cursor.
+    MockBlob[] acrossContainers = [
+        {container: "docs", name: "a.txt", contentType: "text/plain", content: "a".toBytes()},
+        {container: "specs", name: "b.txt", contentType: "text/plain", content: "b".toBytes()},
+        {container: "notes", name: "c.txt", contentType: "text/plain", content: "c".toBytes()}
+    ];
+    MockBlobStore store = new (acrossContainers, pageSize = 1, stickyMarker = true);
     ai:Document[]|error result = loadAll(store, [{container: "*"}]);
     if result is error {
         test:assertTrue(result.message().includes("not advancing"), result.message());
+        test:assertTrue(result.message().includes("container listing"),
+                string `The CONTAINER cursor must be the one reported: ${result.message()}`);
     } else {
         test:assertFail("A non-advancing container cursor must be reported too");
     }
@@ -458,6 +489,7 @@ isolated function testAStuckContainerCursorIsReported() {
 isolated function testUnaddressableBlobNamesAreSkippedInAListing() returns error? {
     MockBlob[] awkward = [
         {container: "docs", name: "notes#1.txt", contentType: "text/plain", content: "hash".toBytes()},
+        {container: "docs", name: "what?.txt", contentType: "text/plain", content: "qm".toBytes()},
         {container: "docs", name: "50%-done.txt", contentType: "text/plain", content: "pct".toBytes()},
         {container: "docs", name: "résumé.txt", contentType: "text/plain", content: "acc".toBytes()},
         {container: "docs", name: "fine.txt", contentType: "text/plain", content: "ok".toBytes()}
@@ -471,7 +503,7 @@ isolated function testUnaddressableBlobNamesAreSkippedInAListing() returns error
 
 @test:Config {}
 isolated function testUnaddressableConfiguredPathIsRejectedAtInit() {
-    foreach string path in ["/notes#1.txt", "/50%-done.txt", "/résumés/"] {
+    foreach string path in ["/notes#1.txt", "/what?.txt", "/50%-done.txt", "/résumés/"] {
         ResolvedSource[]|ai:Error resolved = resolveSources([{container: "docs", paths: [path]}]);
         if resolved is ai:Error {
             test:assertTrue(resolved.message().includes("not addressable"), resolved.message());
@@ -487,6 +519,9 @@ isolated function testOrdinaryPathsRemainAddressable() {
     test:assertTrue(isAddressableBlobName("a-b_c.d~e"));
     test:assertTrue(isAddressableBlobName(""), "The container root is addressable");
     test:assertFalse(isAddressableBlobName("a#b"));
+    // `?` opens the query string, so the path is truncated exactly as `#` truncates it — and
+    // under SAS auth the token the connector appends merges into that query.
+    test:assertFalse(isAddressableBlobName("a?b"));
     test:assertFalse(isAddressableBlobName("a%20b"));
     test:assertFalse(isAddressableBlobName("café.txt"));
 }

@@ -53,18 +53,19 @@ public isolated class TextDataLoader {
     # misconfigured source fails immediately instead of part-way through a long load, after
     # documents have already been fetched and then discarded.
     #
-    # + connection - The Azure Blob Storage connector configuration shared by all sources, or an
-    #                existing `blobs:BlobClient` to reuse (not owned by the loader)
+    # + azureConnection - The Azure Blob Storage connector configuration shared by all sources, or
+    #                     an existing `blobs:BlobClient` to reuse (not owned by the loader)
     # + sources - One or more Azure Blob containers to load documents from
     # + return - An `ai:Error` if the loader could not be initialized or a source is invalid
     public isolated function init(
-            @display {label: "Connection"} blobs:ConnectionConfig|blobs:BlobClient connection,
+            @display {label: "Azure Connection"} blobs:ConnectionConfig|blobs:BlobClient azureConnection,
             @display {label: "Data Sources"} Source[] sources) returns ai:Error? {
         // Sources are validated before the connection is resolved, so a misconfigured source
         // fails identically for both connection forms.
         ResolvedSource[] resolved = check resolveSources(sources);
-        blobs:BlobClient blobClient =
-            connection is blobs:BlobClient ? connection : check newBlobClient(connection);
+        blobs:BlobClient blobClient = azureConnection is blobs:BlobClient
+            ? azureConnection
+            : check newBlobClient(azureConnection);
         self.loader = new (new ConnectorBlobStore(blobClient), resolved);
     }
 
@@ -99,15 +100,15 @@ isolated function resolveSources(Source[] sources) returns ResolvedSource[]|ai:E
         string[] paths = [];
         foreach string rawPath in src.paths {
             string path = normalizeBlobPath(rawPath);
-            // ⬆️ UPSTREAM (see `isAddressableBlobName`): the connector percent-encodes neither
+            // UPSTREAM (see `isAddressableBlobName`): the connector percent-encodes neither
             // the request path nor the `prefix` query parameter, so such a path cannot be
             // requested at all. Rejected here rather than at load time, because a configured
             // path is a deliberate choice and the resulting 400 would name nothing useful.
             if !isAddressableBlobName(path) {
                 return error ai:Error(string `The path '${rawPath}' cannot be used: the Azure ` +
                     string `Storage connector does not percent-encode request paths, so blob ` +
-                    string `names and prefixes containing '#', '%' or non-ASCII characters are ` +
-                    string `not addressable`);
+                    string `names and prefixes containing '#', '?', '%' or non-ASCII characters ` +
+                    string `are not addressable`);
             }
             paths.push(path);
         }
@@ -256,21 +257,57 @@ isolated class BlobLoader {
     //
     // An explicitly named blob (`loadNamedBlob`) still errors — naming a blob expresses intent,
     // so failing to load it is a mistake worth reporting rather than a silent skip.
+    //
+    // Each listing page is filtered and converted as it arrives, rather than the whole listing
+    // being accumulated first: `MAX_LISTING_PAGES` allows 10 000 pages, which at Azure's page
+    // size is 50 million entries, and most of them are typically discarded by the filters below.
+    // Only one page of listing metadata is ever resident.
     private isolated function listPrefix(string container, string prefix, boolean recursive,
             string[]? includeExtensions, boolean tolerateMissing, map<boolean> seen)
             returns ai:Document[]|ai:Error {
-        blobs:Blob[]|error blobList = self.listAllBlobs(container, prefix);
-        if blobList is error {
-            if tolerateMissing && isNotFoundError(blobList) {
-                return [];
-            }
-            return error ai:Error(string `Failed to list blobs under prefix '${prefix}' in ` +
-                string `container '${container}': ${blobList.message()}`, blobList);
-        }
-
         ai:Document[] documents = [];
         int skipped = 0;
-        foreach blobs:Blob blob in blobList {
+        string? prefixArg = prefix == "" ? () : prefix;
+        string? marker = ();
+        int pages = 0;
+        while true {
+            blobs:ListBlobResult|error result = self.store->listBlobs(container, marker, prefixArg);
+            if result is error {
+                if tolerateMissing && isNotFoundError(result) {
+                    return documents;
+                }
+                return error ai:Error(string `Failed to list blobs under prefix '${prefix}' in ` +
+                    string `container '${container}': ${result.message()}`, result);
+            }
+            skipped += self.collectPage(container, prefix, recursive, includeExtensions, seen,
+                    result.blobList, documents);
+            pages += 1;
+            check guardPagination(result.nextMarker, marker,
+                    pages, string `the listing of prefix '${prefix}' in container '${container}'`);
+            if result.nextMarker == "" {
+                break;
+            }
+            marker = result.nextMarker;
+        }
+
+        // A prefix where everything was skipped otherwise looks identical to an empty one: the
+        // caller gets an empty array and would have to read the logs line by line to tell the
+        // difference. Summarise it once instead.
+        if skipped > 0 {
+            log:printWarn("Some Azure Blob Storage files under this prefix were skipped",
+                    container = container, prefix = prefix, loaded = documents.length(), skipped = skipped);
+        }
+        return documents;
+    }
+
+    // Filters one listing page and appends the documents it yields to `documents`, returning
+    // how many of its entries were skipped. Split out of `listPrefix` so that the page walk
+    // stays readable and no page is retained beyond this call.
+    private isolated function collectPage(string container, string prefix, boolean recursive,
+            string[]? includeExtensions, map<boolean> seen, blobs:Blob[] page,
+            ai:Document[] documents) returns int {
+        int skipped = 0;
+        foreach blobs:Blob blob in page {
             BlobEntry entry = toBlobEntry(blob);
             string name = entry.name;
             // Some tools create zero-length "folder marker" blobs whose name ends with `/`.
@@ -285,13 +322,13 @@ isolated class BlobLoader {
                 continue;
             }
             // UPSTREAM (see `isAddressableBlobName`): the connector cannot build a valid
-            // request path for a name containing `#`, `%`, or non-ASCII. Naming the real
-            // problem here beats letting it surface as an opaque 400, or — for `#` — as a
-            // successful download of the WRONG blob, which no error would ever reveal.
+            // request path for a name containing `#`, `?`, `%`, or non-ASCII. Naming the real
+            // problem here beats letting it surface as an opaque 400, or — for `#` and `?` — as
+            // a successful download of the WRONG blob, which no error would ever reveal.
             if !isAddressableBlobName(name) {
                 log:printWarn("Skipping an Azure Blob Storage file whose name cannot be addressed " +
-                        "by the connector: names containing '#', '%' or non-ASCII characters are " +
-                        "not percent-encoded in the request path",
+                        "by the connector: names containing '#', '?', '%' or non-ASCII characters " +
+                        "are not percent-encoded in the request path",
                         fileName = name, container = container);
                 skipped += 1;
                 continue;
@@ -328,36 +365,7 @@ isolated class BlobLoader {
             }
             documents.push(document);
         }
-
-        // A prefix where everything was skipped otherwise looks identical to an empty one: the
-        // caller gets an empty array and would have to read the logs line by line to tell the
-        // difference. Summarise it once instead.
-        if skipped > 0 {
-            log:printWarn("Some Azure Blob Storage files under this prefix were skipped",
-                    container = container, prefix = prefix, loaded = documents.length(), skipped = skipped);
-        }
-        return documents;
-    }
-
-    // Lists all blobs under a prefix, following the `NextMarker` pagination cursor. An empty
-    // `prefix` lists the whole container.
-    private isolated function listAllBlobs(string container, string prefix) returns blobs:Blob[]|error {
-        blobs:Blob[] all = [];
-        string? marker = ();
-        int pages = 0;
-        while true {
-            string? prefixArg = prefix == "" ? () : prefix;
-            blobs:ListBlobResult result = check self.store->listBlobs(container, marker, prefixArg);
-            all.push(...result.blobList);
-            pages += 1;
-            check guardPagination(result.nextMarker, marker,
-                    pages, string `the listing of prefix '${prefix}' in container '${container}'`);
-            if result.nextMarker == "" {
-                break;
-            }
-            marker = result.nextMarker;
-        }
-        return all;
+        return skipped;
     }
 
     // Downloads a blob's content and converts it into an `ai:TextDocument`. Only ever called
@@ -455,8 +463,13 @@ isolated function headerValue(blobs:ResponseHeaders headers, string name) return
     map<anydata> entries = headers;
     string wanted = name.toLowerAscii();
     foreach var [key, value] in entries.entries() {
-        if key.toLowerAscii() == wanted && value is string && value.trim() != "" {
-            return value;
+        if key.toLowerAscii() == wanted && value is string {
+            // The trimmed value is what is returned, not just what is tested: `classify` and
+            // `decimalFromString` must see the same string the blankness check judged.
+            string trimmed = value.trim();
+            if trimmed != "" {
+                return trimmed;
+            }
         }
     }
     return ();
@@ -465,11 +478,14 @@ isolated function headerValue(blobs:ResponseHeaders headers, string name) return
 // Reports whether a connector error represents a 404 (blob or container not found), used to
 // disambiguate file-vs-folder paths and to honour `tolerateMissing`.
 isolated function isNotFoundError(error e) returns boolean {
+    // A `blobs:ServerError` carries the status and the Azure error code as typed fields, so it
+    // ANSWERS THE QUESTION on its own — no message heuristic runs against it. Falling through
+    // to the text match would let a 500 whose body happens to say "not found" be treated as a
+    // missing blob, which under `tolerateMissing` silently drops a container that was really
+    // erroring. The heuristics below exist only for errors that carry no status at all.
     if e is blobs:ServerError {
         blobs:ServerErrorDetail detail = e.detail();
-        if detail.httpStatus == 404 || detail.errorCode.toLowerAscii().includes("notfound") {
-            return true;
-        }
+        return detail.httpStatus == 404 || detail.errorCode.toLowerAscii().includes("notfound");
     }
     // A 404 also arrives as an untyped error, whose own message is only the fixed wrapper
     // "(ballerinax/azure-storage-service)BlobError" — the status text ("Status Code: 404 The

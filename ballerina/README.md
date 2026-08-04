@@ -158,14 +158,14 @@ Sources and paths may overlap freely — `paths: ["/", "/reports"]`, the same co
 
 ### Blob name limitations
 
-Blob names containing **`#`**, **`%`**, or **non-ASCII characters** cannot currently be loaded. The underlying `ballerinax/azure_storage_service.blobs` connector does not percent-encode the request path or the `prefix` query parameter, so such a name is either truncated at the `#` (which can silently return a *different* blob), rejected with a 400, or sent raw and mangled.
+Blob names containing **`#`**, **`?`**, **`%`**, or **non-ASCII characters** cannot currently be loaded. The underlying `ballerinax/azure_storage_service.blobs` connector does not percent-encode the request path or the `prefix` query parameter, so such a name is either truncated at the `#` or `?` (which can silently return a *different* blob — and, under SAS auth, merges the token into the query the name just opened), rejected with a 400, or sent raw and mangled.
 
 The loader cannot correct this from the outside: pre-encoding the name would be double-encoded for SAS auth and would invalidate the Shared Key signature, which is computed over the decoded resource path. So instead:
 
 - a blob with such a name **discovered in a listing** is skipped with a warning naming the reason;
 - a **configured path** containing one of these characters is rejected at `init` with a clear error, rather than failing later with an opaque 400.
 
-This is an upstream limitation; see `REVIEW-CHECKLIST.md` (`IMPL1`) for the issue to be filed.
+This is a limitation of the connector, not of Azure: the names themselves are valid. It is resolved upstream by percent-encoding the path segment and the query values, and computing the Shared Key signature over the *decoded* resource path, as the Azure signing specification requires.
 
 ### Retries and response limits
 
@@ -173,7 +173,7 @@ When the loader constructs its own client from a `blobs:ConnectionConfig`, it fi
 
 | Setting | Default applied | Rationale |
 | --- | --- | --- |
-| `retryConfig` | 4 attempts, 1 s interval, backoff factor 2.0, max wait 20 s, on `429, 500, 502, 503, 504` | Azure signals throttling as 503 `ServerBusy` / 500 `OperationTimedOut` and account request-rate limits as 429, and documents exponential backoff as the required response. **403 is deliberately not retried**: Azure Storage uses it for authorization failures (bad Shared Key signature, expired or under-scoped SAS), which waiting cannot fix |
+| `retryConfig` | 4 retries (up to 5 requests in total), 1 s interval, backoff factor 2.0, max wait 20 s, on `429, 500, 502, 503, 504` | Azure signals throttling as 503 `ServerBusy` / 500 `OperationTimedOut` and account request-rate limits as 429, and documents exponential backoff as the required response. **403 is deliberately not retried**: Azure Storage uses it for authorization failures (bad Shared Key signature, expired or under-scoped SAS), which waiting cannot fix |
 | `responseLimits.maxEntityBodySize` | 100 MB | Unset, this is unlimited, and a container is exactly where a multi-gigabyte object turns up. A blob above the cap fails that one blob, which a prefix listing then skips like any other per-blob failure |
 
 Neither default is applied to a caller-supplied `blobs:BlobClient`.

@@ -218,12 +218,24 @@ isolated function essenceOf(string? contentType) returns string {
 }
 
 // Returns the lower-cased file extension (without the dot), or `""` if none.
+//
+// The search is confined to the LAST path segment. Blob names are full paths, and a dot in an
+// ancestor folder ("v1.2/notes") is not an extension of anything: taking the last dot over the
+// whole path would answer "2/notes", which is neither empty nor a real extension. That answer
+// then reaches `loadPath`, where a non-empty extension means "this path names a file", so a
+// missing blob under a dotted FOLDER name would be reported as `blob not found` instead of
+// being listed as the prefix it is.
 isolated function getExtension(string fileName) returns string {
-    int? lastDotIndex = fileName.lastIndexOf(".");
+    string basename = fileName;
+    int? lastSlashIndex = fileName.lastIndexOf("/");
+    if lastSlashIndex is int {
+        basename = fileName.substring(lastSlashIndex + 1);
+    }
+    int? lastDotIndex = basename.lastIndexOf(".");
     if lastDotIndex is () {
         return "";
     }
-    return fileName.substring(lastDotIndex + 1).toLowerAscii();
+    return basename.substring(lastDotIndex + 1).toLowerAscii();
 }
 
 // Reports whether a file passes the extension allowlist (`()`/empty matches all).
@@ -329,12 +341,14 @@ isolated function propDecimal(map<json> properties, string key) returns decimal?
 
 // Reports whether a blob name can be addressed through the connector at all.
 //
-// ⬆️ UPSTREAM: `ballerinax/azure_storage_service.blobs` interpolates the blob name straight
-// into the request path without percent-encoding it. Three characters that are legal in an
-// Azure blob name therefore break:
+// UPSTREAM: `ballerinax/azure_storage_service.blobs` interpolates the blob name straight
+// into the request path without percent-encoding it. Characters that are legal in an Azure
+// blob name therefore break:
 //
 // - `#` starts a URI fragment, so the path is silently TRUNCATED at it and the request either
 //   404s or, worse, addresses a different blob than the one intended;
+// - `?` starts the query string, truncating the path the same way — and under SAS auth the
+//   token the connector appends merges into the query the name just opened;
 // - `%` begins a percent-escape the server then fails to decode, giving a 400;
 // - non-ASCII is sent raw, which is not valid in a request line and is rejected or mangled.
 //
@@ -344,7 +358,10 @@ isolated function propDecimal(map<json> properties, string key) returns decimal?
 // opaque 400/404 from somewhere deep in the connector. See the README's "Blob name
 // limitations".
 isolated function isAddressableBlobName(string blobName) returns boolean {
-    if blobName.includes("#") || blobName.includes("%") {
+    // `?` fails exactly as `#` does: unencoded, it starts the query string, so the path is
+    // truncated at it — and under SAS auth the appended token merges into the query the name
+    // just opened, corrupting both.
+    if blobName.includes("#") || blobName.includes("%") || blobName.includes("?") {
         return false;
     }
     // Any code point above U+007F is non-ASCII. `blobName.toBytes()` is UTF-8, so a name that

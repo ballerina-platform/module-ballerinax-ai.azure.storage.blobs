@@ -96,6 +96,11 @@ isolated function testNewBlobClientAcceptsAnImmutableConfig() returns error? {
 isolated function testNewBlobClientHonoursAnExplicitRetryConfig() returns error? {
     // An explicit value always wins over the default — including one that deliberately
     // disables retrying.
+    //
+    // Asserted against the EFFECTIVE config, not the caller's record: the caller's record only
+    // shows that nothing mutated it (which `testNewBlobClientLeavesCallerConfigUntouched`
+    // already covers), and would look identical if the defaulting had overwritten the policy on
+    // its way to the connector.
     http:RetryConfig noRetry = {count: 0, interval: 0};
     blobs:ConnectionConfig config = {
         accountName: "contosostorage",
@@ -103,8 +108,28 @@ isolated function testNewBlobClientHonoursAnExplicitRetryConfig() returns error?
         authorizationMethod: blobs:SAS,
         retryConfig: noRetry
     };
+    blobs:ConnectionConfig effective = applyConnectionDefaults(config);
+    test:assertEquals(effective.retryConfig?.count, 0,
+            "The caller's retry policy is what reaches the connector");
+    test:assertEquals(effective.responseLimits?.maxEntityBodySize,
+            DEFAULT_RESPONSE_LIMITS.maxEntityBodySize,
+            "The limit the caller did NOT set is still defaulted");
     _ = check newBlobClient(config);
-    test:assertEquals(config.retryConfig?.count, 0, "The caller's retry policy is preserved");
+}
+
+@test:Config {}
+isolated function testEffectiveConfigDefaultsWhatTheCallerLeftUnset() {
+    blobs:ConnectionConfig config = {
+        accountName: "contosostorage",
+        accessKeyOrSAS: "?sv=2022-11-02&sig=abc",
+        authorizationMethod: blobs:SAS
+    };
+    blobs:ConnectionConfig effective = applyConnectionDefaults(config);
+    test:assertEquals(effective.retryConfig?.count, DEFAULT_RETRY_CONFIG.count);
+    test:assertEquals(effective.retryConfig?.statusCodes, DEFAULT_RETRY_CONFIG.statusCodes);
+    test:assertEquals(effective.responseLimits?.maxEntityBodySize,
+            DEFAULT_RESPONSE_LIMITS.maxEntityBodySize);
+    test:assertEquals(effective.accountName, config.accountName, "Unrelated fields pass through");
 }
 
 @test:Config {}
