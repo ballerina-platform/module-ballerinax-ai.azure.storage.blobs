@@ -131,7 +131,7 @@ Each `Source` has its own `includeExtensions` to restrict which blobs are loaded
 
 - `includeExtensions: ["pdf"]` — only PDF blobs.
 - `includeExtensions: ["pdf", ".md", "TXT"]` — case-insensitive; a leading dot is optional.
-- omitted / `()` (the default) — load all types.
+- omitted (the default) — load all types.
 
 The filter applies to blobs discovered while listing a folder prefix. A blob listed **explicitly** in `paths` is always loaded, even if its extension isn't in the list.
 
@@ -218,4 +218,4 @@ Alternatively, pass an already-constructed `blobs:BlobClient` — see [Reusing a
 | `container` | `string` | — | The container name to read from, or `"*"` for every container in the account |
 | `paths` | `string[]` | `["/"]` | Blob-name prefixes (virtual-folder paths) and/or explicit blob names. The default `["/"]` loads the whole container; `[]` loads nothing |
 | `recursive` | `boolean` | `false` | Whether folder prefixes are traversed into virtual sub-folders |
-| `includeExtensions` | `string[]?` | `()` | Extension allowlist applied to folder-prefix contents (e.g. `["pdf"]`). Case-insensitive; `()` loads all types. Explicit blob paths bypass it |
+| `includeExtensions` | `string[]?` | unset | Extension allowlist applied to folder-prefix contents (e.g. `["pdf"]`). Case-insensitive; when unset, all types are loaded. Explicit blob paths bypass it |

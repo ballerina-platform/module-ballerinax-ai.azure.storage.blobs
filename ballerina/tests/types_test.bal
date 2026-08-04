@@ -25,7 +25,7 @@ isolated function testSourceDefaults() {
     Source src = {container: "documents"};
     test:assertEquals(src.paths, ["/"], "paths defaults to the whole container");
     test:assertFalse(src.recursive, "recursive defaults to false");
-    test:assertTrue(src.includeExtensions is (), "includeExtensions defaults to () (all types)");
+    test:assertTrue(src?.includeExtensions is (), "includeExtensions is unset by default (all types)");
 }
 
 @test:Config {}
@@ -39,7 +39,7 @@ isolated function testSourceExplicitValues() {
     test:assertEquals(src.container, "specs");
     test:assertEquals(src.paths.length(), 2);
     test:assertTrue(src.recursive);
-    test:assertEquals(src.includeExtensions, ["pdf", ".md"]);
+    test:assertEquals(src?.includeExtensions, ["pdf", ".md"]);
 }
 
 // ---- newBlobClient construction ---------------------------------------------

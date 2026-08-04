@@ -116,7 +116,7 @@ isolated function resolveSources(Source[] sources) returns ResolvedSource[]|ai:E
             container,
             paths,
             recursive: src.recursive,
-            includeExtensions: src.includeExtensions,
+            includeExtensions: src?.includeExtensions,
             // The `"*"` container applies the same paths to every container in the account,
             // where a path need not exist in all of them.
             tolerateMissing: container == "*"

@@ -27,8 +27,8 @@ public type Source record {|
     # Whether virtual sub-folders under a prefix are traversed. Defaults to `false`.
     boolean recursive = false;
     # Case-insensitive extension allowlist for prefix listings.
-    # Defaults to `()`, all types.
-    string[]? includeExtensions = ();
+    # When not specified, all types are loaded.
+    string[] includeExtensions?;
 |};
 
 // A source with its paths already normalized to Azure blob-name prefixes and its container
