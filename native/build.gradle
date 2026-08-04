@@ -1,0 +1,43 @@
+/*
+ * Copyright (c) 2026, WSO2 LLC. (http://www.wso2.com).
+ *
+ * WSO2 LLC. licenses this file to you under the Apache License,
+ * Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+plugins {
+    id 'java'
+}
+
+description = 'Azure Blob Storage document data loader - Java native utils'
+
+dependencies {
+    // Provided by the Ballerina runtime at execution time.
+    implementation group: 'org.ballerinalang', name: 'ballerina-runtime', version: "${ballerinaLangVersion}"
+
+    // Apache Tika: text extraction for PDF and Microsoft Office documents. Only the three
+    // artifacts the Java source references directly are compile ('implementation') deps here.
+    // The remaining runtime artifacts pulled in transitively by the microsoft-module
+    // (tika-parser-zip-commons, the POI/XMLBeans/commons/SparseBitSet/log4j stack) are NOT
+    // needed to compile this jar; they are declared as runtime `platform.java21` dependencies
+    // in ballerina/Ballerina.toml so they land on the executable's classpath. The pdf-module
+    // provides PDFBox (PDFParser); the microsoft-module provides POI (OOXMLParser / OfficeParser).
+    implementation group: 'org.apache.tika', name: 'tika-core', version: "${tikaVersion}"
+    implementation group: 'org.apache.tika', name: 'tika-parser-pdf-module', version: "${tikaVersion}"
+    implementation group: 'org.apache.tika', name: 'tika-parser-microsoft-module', version: "${tikaVersion}"
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}

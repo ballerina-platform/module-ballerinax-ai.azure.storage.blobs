@@ -22,20 +22,31 @@
 # Keep the Gradle wrapper jar
 !gradle/wrapper/gradle-wrapper.jar
 
+# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
+hs_err_pid*
+replay_pid*
+
 # Build output
 .gradle/
 build/
 target/
 bin/
+*.balx
+generated/
+.ballerina
 
-# IDE
+# Ballerina runtime/test configuration — may hold account keys or SAS tokens
+**/Config.toml
+
+# PR #2 review working document — tracking only, not part of the deliverable
+REVIEW-CHECKLIST.md
+
+# IDE / OS
 .idea/
 *.iml
 .vscode/
-
-# Ballerina
-Dependencies.toml
-
-# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
-hs_err_pid*
-replay_pid*
+.classpath
+.settings
+.project
+*.DS_Store
+docker.env
