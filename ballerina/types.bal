@@ -18,8 +18,7 @@
 # per loader. A container is the unit of addressing; there is no site/library chain, so a
 # container maps directly to a `Source`.
 public type Source record {|
-    # The container name to read from, or `"*"` for every container in the account.
-    # For `"*"`, a missing path is tolerated (skipped) rather than an error.
+    # The container name to read from.
     string container;
     # Blob-name prefixes (virtual-folder paths, e.g. `/reports`) to read.
     # Defaults to `["/"]`, the whole container; `[]` reads nothing.
@@ -42,9 +41,6 @@ type ResolvedSource record {|
     string[] paths;
     boolean recursive;
     string[]? includeExtensions;
-    // True for the `"*"` container, where the same paths are applied to every container in the
-    // account and so need not exist in all of them: a missing path is skipped, not an error.
-    boolean tolerateMissing;
 |};
 
 // A normalized listing entry, decoupled from the connector's `Blob` record (whose

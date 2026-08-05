@@ -82,18 +82,17 @@ isolated function applyConnectionDefaults(blobs:ConnectionConfig config) returns
     return effective;
 }
 
-// The four Azure Blob operations this loader performs, named as an object type so the whole
+// The three Azure Blob operations this loader performs, named as an object type so the whole
 // load path can be exercised against a fake.
 //
 // A seam at this boundary, rather than an HTTP-level mock of the Blob REST surface, is forced
 // by the connector: `blobs:BlobClient` derives its base URL from the account name
 // (`https://{account}.blob.core.windows.net`) and offers no way to redirect it, so no test
 // listener can ever receive its requests. Everything above this interface — pagination, the
-// `"*"` fan-out, the file-vs-folder probe, classification, the skip-don't-abort walk — is
-// therefore testable offline, while the interface itself stays a pass-through thin enough that
-// nothing meaningful can hide in it.
+// file-vs-folder probe, classification, the skip-don't-abort walk — is therefore testable
+// offline, while the interface itself stays a pass-through thin enough that nothing meaningful
+// can hide in it.
 type BlobStore isolated client object {
-    isolated remote function listContainers(string? marker) returns blobs:ListContainerResult|error;
     isolated remote function listBlobs(string container, string? marker, string? prefix)
             returns blobs:ListBlobResult|error;
     isolated remote function getBlobProperties(string container, string blobName)
@@ -110,10 +109,6 @@ isolated client class ConnectorBlobStore {
 
     isolated function init(blobs:BlobClient blobClient) {
         self.blobClient = blobClient;
-    }
-
-    isolated remote function listContainers(string? marker) returns blobs:ListContainerResult|error {
-        return self.blobClient->listContainers((), marker, ());
     }
 
     isolated remote function listBlobs(string container, string? marker, string? prefix)

@@ -152,14 +152,6 @@ isolated function testIsDirectChildRequiresThePrefix() {
     test:assertFalse(isDirectChild("q1.pdf", "reports/"), "A shorter unrelated name is not a child");
 }
 
-// ---- dedupeStrings -----------------------------------------------------------
-
-@test:Config {}
-isolated function testDedupeStringsPreservesOrder() {
-    test:assertEquals(dedupeStrings(["a", "b", "a", "c", "b"]), ["a", "b", "c"]);
-    test:assertEquals(dedupeStrings([]), []);
-}
-
 // ---- propString / propDecimal ------------------------------------------------
 
 @test:Config {}
@@ -294,8 +286,8 @@ isolated function testIsNotFoundErrorFromMessageText() {
 
 // A typed `ServerError` carries the status, so it settles the question by itself — the message
 // heuristics below it apply only to errors that have no status at all. Without this precedence
-// a 500 whose body happens to mention "not found" reads as a missing blob, and under
-// `tolerateMissing` a container that is genuinely erroring is silently skipped instead.
+// a 500 whose body happens to mention "not found" reads as a missing blob instead of the error
+// it actually is.
 @test:Config {}
 isolated function testIsNotFoundErrorIgnoresMessageTextWhenTheStatusSaysOtherwise() {
     blobs:ServerError err = error("failed",

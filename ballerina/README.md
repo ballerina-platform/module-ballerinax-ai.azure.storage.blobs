@@ -10,7 +10,7 @@ The acquisition layer — authentication, blob listing, download, and pagination
 
 - Reads blobs from one or more Azure Blob **containers** in a storage account.
 - Loads individual blobs as well as entire virtual folders (blob-name prefixes), optionally recursively.
-- Reads from multiple containers — including **every** container in the account — with a single loader instance.
+- Reads from multiple containers with a single loader instance.
 - Follows the `NextMarker` cursor to page through large containers automatically.
 - Returns every blob as an `ai:TextDocument`, based on its `Content-Type` (authoritative) and, when
   that is missing or unrecognised, its file extension:
@@ -117,14 +117,6 @@ By default a folder prefix loads only the blobs **directly** under it. Set `recu
 {container: "documents", paths: ["/reports"], recursive: true}
 ```
 
-### Reading from every container
-
-Set `container` to `"*"` to read from **every** container in the storage account. Because the `paths` are then applied to all containers, a path that does not exist in a given container is **skipped** for it rather than treated as an error:
-
-```ballerina
-{container: "*", paths: ["/shared"], recursive: true}
-```
-
 ### Filtering by file type
 
 Each `Source` has its own `includeExtensions` to restrict which blobs are loaded from folder prefixes:
@@ -154,7 +146,7 @@ One extension is deliberately **not** treated as text: `.ts`, which is both Type
 
 ### Overlapping sources
 
-Sources and paths may overlap freely — `paths: ["/", "/reports"]`, the same container listed twice, or a container reached both directly and through `"*"`. Each blob is loaded **once**: duplicates are identified by `container` + blob name and skipped before they are downloaded, so an overlap costs neither a duplicate document nor a second request. Identical blob names in *different* containers are distinct and both load.
+Sources and paths may overlap freely — `paths: ["/", "/reports"]`, or the same container listed twice. Each blob is loaded **once**: duplicates are identified by `container` + blob name and skipped before they are downloaded, so an overlap costs neither a duplicate document nor a second request. Identical blob names in *different* containers are distinct and both load.
 
 ### Blob name limitations
 
@@ -215,7 +207,7 @@ Alternatively, pass an already-constructed `blobs:BlobClient` — see [Reusing a
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `container` | `string` | — | The container name to read from, or `"*"` for every container in the account |
+| `container` | `string` | — | The container name to read from |
 | `paths` | `string[]` | `["/"]` | Blob-name prefixes (virtual-folder paths) and/or explicit blob names. The default `["/"]` loads the whole container; `[]` loads nothing |
 | `recursive` | `boolean` | `false` | Whether folder prefixes are traversed into virtual sub-folders |
 | `includeExtensions` | `string[]?` | unset | Extension allowlist applied to folder-prefix contents (e.g. `["pdf"]`). Case-insensitive; when unset, all types are loaded. Explicit blob paths bypass it |

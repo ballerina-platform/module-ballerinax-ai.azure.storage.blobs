@@ -15,8 +15,8 @@
 // under the License.
 
 // End-to-end coverage of `load()` against the in-memory account in `mock_store.bal`. Everything
-// above the connector boundary runs for real here: source normalization, container fan-out,
-// `NextMarker` pagination, the file-vs-folder probe, classification, the extension filter, the
+// above the connector boundary runs for real here: source normalization, `NextMarker`
+// pagination, the file-vs-folder probe, classification, the extension filter, the
 // skip-don't-abort walk, and the single-document collapse.
 
 import ballerina/ai;
@@ -234,61 +234,6 @@ isolated function testListingFollowsNextMarkerAcrossPages() returns error? {
 }
 
 @test:Config {}
-isolated function testContainerListingFollowsNextMarkerAcrossPages() returns error? {
-    MockBlob[] spread = [];
-    foreach int i in 0 ..< 5 {
-        spread.push({
-            container: string `c${i}`,
-            name: "notes.txt",
-            contentType: "text/plain",
-            content: "n".toBytes()
-        });
-    }
-    MockBlobStore store = new (spread, pageSize = 2);
-    ai:Document[] documents = check loadAll(store, [{container: "*"}]);
-    test:assertEquals(documents.length(), 5, "Every page of a paginated container listing is consumed");
-}
-
-// ---- the "*" container fan-out ----------------------------------------------
-
-@test:Config {}
-isolated function testStarLoadsEveryContainer() returns error? {
-    MockBlob[] across = [
-        {container: "docs", name: "a.txt", contentType: "text/plain", content: "a".toBytes()},
-        {container: "specs", name: "b.txt", contentType: "text/plain", content: "b".toBytes()}
-    ];
-    MockBlobStore store = new (across);
-    ai:Document[] documents = check loadAll(store, [{container: "*"}]);
-    assertLoaded(documents, ["a.txt", "b.txt"], "\"*\" reads from every container in the account");
-}
-
-@test:Config {}
-isolated function testStarToleratesMissingPathInSomeContainers() returns error? {
-    MockBlob[] across = [
-        {container: "docs", name: "shared/a.txt", contentType: "text/plain", content: "a".toBytes()},
-        {container: "specs", name: "elsewhere/b.txt", contentType: "text/plain", content: "b".toBytes()}
-    ];
-    MockBlobStore store = new (across);
-    // `shared/` exists only in `docs`. Under "*" that is a skip, not an error.
-    ai:Document[] documents = check loadAll(store, [{container: "*", paths: ["/shared"]}]);
-    assertLoaded(documents, ["shared/a.txt"],
-            "A path absent from a container is skipped under \"*\", not fatal");
-}
-
-@test:Config {}
-isolated function testStarToleratesMissingNamedBlob() returns error? {
-    MockBlob[] across = [
-        {container: "docs", name: "policy.txt", contentType: "text/plain", content: "p".toBytes()},
-        {container: "specs", name: "other.txt", contentType: "text/plain", content: "o".toBytes()}
-    ];
-    MockBlobStore store = new (across);
-    // A file-looking path missing from `specs` would be an error for a named container.
-    ai:Document[] documents = check loadAll(store, [{container: "*", paths: ["/policy.txt"]}]);
-    assertLoaded(documents, ["policy.txt"],
-            "A named blob missing from one container is skipped under \"*\"");
-}
-
-@test:Config {}
 isolated function testMissingNamedContainerIsAnError() {
     MockBlobStore store = new (sampleBlobs());
     ai:Document[]|error result = loadAll(store, [{container: "nope"}]);
@@ -409,18 +354,6 @@ isolated function testOverlappingSourcesLoadEachBlobOnce() returns error? {
 }
 
 @test:Config {}
-isolated function testStarAndAnExplicitContainerDoNotDuplicate() returns error? {
-    MockBlob[] across = [
-        {container: "docs", name: "a.txt", contentType: "text/plain", content: "a".toBytes()},
-        {container: "specs", name: "b.txt", contentType: "text/plain", content: "b".toBytes()}
-    ];
-    MockBlobStore store = new (across);
-    ai:Document[] documents = check loadAll(store, [{container: "*"}, {container: "docs"}]);
-    assertLoaded(documents, ["a.txt", "b.txt"],
-            "A container reached both through \"*\" and directly yields each blob once");
-}
-
-@test:Config {}
 isolated function testAnExplicitPathAndItsFolderDoNotDuplicate() returns error? {
     MockBlobStore store = new (sampleBlobs());
     ai:Document[] documents =
@@ -438,7 +371,7 @@ isolated function testSameBlobInDifferentContainersIsNotDeduplicated() returns e
         {container: "specs", name: "notes.txt", contentType: "text/plain", content: "two".toBytes()}
     ];
     MockBlobStore store = new (same);
-    ai:Document[] documents = check loadAll(store, [{container: "*"}]);
+    ai:Document[] documents = check loadAll(store, [{container: "docs"}, {container: "specs"}]);
     test:assertEquals(documents.length(), 2, "Identical names in different containers are distinct");
 }
 
@@ -454,29 +387,6 @@ isolated function testAStuckPaginationCursorIsReportedNotLoopedOn() {
         test:assertTrue(result.message().includes("not advancing"), result.message());
     } else {
         test:assertFail("A non-advancing pagination cursor must be reported, not looped on");
-    }
-}
-
-@test:Config {}
-isolated function testAStuckContainerCursorIsReported() {
-    // The CONTAINER listing has its own cursor and its own guard, so the fixture must span more
-    // containers than `pageSize`: with a single container that listing returns one page and an
-    // empty marker, and the walk ends before the guard ever compares two markers — leaving the
-    // blob listing of that one container to raise the error this test then credits to the
-    // container cursor.
-    MockBlob[] acrossContainers = [
-        {container: "docs", name: "a.txt", contentType: "text/plain", content: "a".toBytes()},
-        {container: "specs", name: "b.txt", contentType: "text/plain", content: "b".toBytes()},
-        {container: "notes", name: "c.txt", contentType: "text/plain", content: "c".toBytes()}
-    ];
-    MockBlobStore store = new (acrossContainers, pageSize = 1, stickyMarker = true);
-    ai:Document[]|error result = loadAll(store, [{container: "*"}]);
-    if result is error {
-        test:assertTrue(result.message().includes("not advancing"), result.message());
-        test:assertTrue(result.message().includes("container listing"),
-                string `The CONTAINER cursor must be the one reported: ${result.message()}`);
-    } else {
-        test:assertFail("A non-advancing container cursor must be reported too");
     }
 }
 
