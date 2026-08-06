@@ -116,10 +116,7 @@ isolated function resolveSources(Source[] sources) returns ResolvedSource[]|ai:E
             container,
             paths,
             recursive: src.recursive,
-            includeExtensions: src?.includeExtensions,
-            // The `"*"` container applies the same paths to every container in the account,
-            // where a path need not exist in all of them.
-            tolerateMissing: container == "*"
+            includeExtensions: src?.includeExtensions
         });
     }
     return resolved;
@@ -139,22 +136,18 @@ isolated class BlobLoader {
 
     isolated function load() returns ai:Document[]|ai:Document|ai:Error {
         ai:Document[] documents = [];
-        // Sources may overlap — `paths: ["/", "/reports"]`, the same container named twice, or
-        // a container reached both directly and through `"*"`. Without this, the same blob
-        // becomes two documents and is duplicated in whatever index the caller builds, having
-        // been downloaded twice to get there. Shared across the whole load, so it de-duplicates
-        // between sources, not just within one.
+        // Sources may overlap — `paths: ["/", "/reports"]`, or the same container named twice.
+        // Without this, the same blob becomes two documents and is duplicated in whatever index
+        // the caller builds, having been downloaded twice to get there. Shared across the whole
+        // load, so it de-duplicates between sources, not just within one.
         map<boolean> seen = {};
         // Sources arrive already normalized and validated (see `init`), so the load path cannot
         // fail on a configuration mistake half-way through.
         foreach ResolvedSource src in self.sources {
-            string[] containers = check self.resolveContainers(src.container);
-            foreach string container in containers {
-                foreach string path in src.paths {
-                    ai:Document[] loaded = check self.loadPath(container, path, src.recursive,
-                            src.includeExtensions, src.tolerateMissing, seen);
-                    documents.push(...loaded);
-                }
+            foreach string path in src.paths {
+                ai:Document[] loaded = check self.loadPath(src.container, path, src.recursive,
+                        src.includeExtensions, seen);
+                documents.push(...loaded);
             }
         }
         if documents.length() == 1 {
@@ -163,43 +156,15 @@ isolated class BlobLoader {
         return documents;
     }
 
-    // Resolves the container names to read from: the single named container, or every
-    // container in the account (paginated) when `"*"`.
-    private isolated function resolveContainers(string container) returns string[]|ai:Error {
-        if container != "*" {
-            return [container];
-        }
-        string[] names = [];
-        string? marker = ();
-        int pages = 0;
-        while true {
-            blobs:ListContainerResult|error result = self.store->listContainers(marker);
-            if result is error {
-                return error ai:Error(string `Failed to list containers: ${result.message()}`, result);
-            }
-            foreach blobs:Container resolved in result.containerList {
-                names.push(resolved.Name);
-            }
-            pages += 1;
-            check guardPagination(result.nextMarker, marker, pages, "the container listing");
-            if result.nextMarker == "" {
-                break;
-            }
-            marker = result.nextMarker;
-        }
-        return dedupeStrings(names);
-    }
-
     // Loads a single normalized path. An empty path (the container root) or one ending in `/`
     // is a folder prefix. Any other path is first probed as an explicitly named blob; if no
     // such blob exists it is treated as a folder prefix, unless it looks like a file (has an
-    // extension), in which case a missing blob is an error (typo detection) — except under
-    // `tolerateMissing` (the `"*"` case), where it is skipped.
+    // extension), in which case a missing blob is an error (typo detection).
     private isolated function loadPath(string container, string path, boolean recursive,
-            string[]? includeExtensions, boolean tolerateMissing, map<boolean> seen)
+            string[]? includeExtensions, map<boolean> seen)
             returns ai:Document[]|ai:Error {
         if path == "" || path.endsWith("/") {
-            return self.listPrefix(container, path, recursive, includeExtensions, tolerateMissing, seen);
+            return self.listPrefix(container, path, recursive, includeExtensions, seen);
         }
 
         // Ambiguous file-or-folder path. The probe is a HEAD (`getBlobProperties`), not a GET:
@@ -218,16 +183,13 @@ isolated class BlobLoader {
             return error ai:Error(string `Failed to load path '${path}' from container ` +
                 string `'${container}': ${properties.message()}`, properties);
         }
-        // No exact blob. If the path looks like a file, a missing blob is an error (unless
-        // tolerated); otherwise treat it as a folder prefix and list it.
+        // No exact blob. If the path looks like a file, a missing blob is an error; otherwise
+        // treat it as a folder prefix and list it.
         if getExtension(path) != "" {
-            if tolerateMissing {
-                return [];
-            }
             return error ai:Error(
                 string `Failed to load path '${path}' from container '${container}': blob not found`);
         }
-        return self.listPrefix(container, path + "/", recursive, includeExtensions, tolerateMissing, seen);
+        return self.listPrefix(container, path + "/", recursive, includeExtensions, seen);
     }
 
     // Loads a single explicitly named blob. Unlike a blob discovered in a prefix listing, a
@@ -263,7 +225,7 @@ isolated class BlobLoader {
     // size is 50 million entries, and most of them are typically discarded by the filters below.
     // Only one page of listing metadata is ever resident.
     private isolated function listPrefix(string container, string prefix, boolean recursive,
-            string[]? includeExtensions, boolean tolerateMissing, map<boolean> seen)
+            string[]? includeExtensions, map<boolean> seen)
             returns ai:Document[]|ai:Error {
         ai:Document[] documents = [];
         int skipped = 0;
@@ -273,9 +235,6 @@ isolated class BlobLoader {
         while true {
             blobs:ListBlobResult|error result = self.store->listBlobs(container, marker, prefixArg);
             if result is error {
-                if tolerateMissing && isNotFoundError(result) {
-                    return documents;
-                }
                 return error ai:Error(string `Failed to list blobs under prefix '${prefix}' in ` +
                     string `container '${container}': ${result.message()}`, result);
             }
@@ -419,9 +378,9 @@ isolated function guardPagination(string nextMarker, string? previousMarker, int
 // Records a blob as loaded, returning `false` when it had already been seen.
 //
 // The key is `container + "/" + blobName`, which is unique across a storage account. Sources
-// overlap easily — `paths: ["/", "/reports"]`, the same container listed twice, or a container
-// reached both directly and through `"*"` — and without this the same blob becomes two
-// identical documents, duplicating it in whatever index the caller builds.
+// overlap easily — `paths: ["/", "/reports"]`, or the same container listed twice — and without
+// this the same blob becomes two identical documents, duplicating it in whatever index the
+// caller builds.
 isolated function markSeen(map<boolean> seen, string container, string blobName) returns boolean {
     string key = container + "/" + blobName;
     if seen.hasKey(key) {
@@ -476,13 +435,12 @@ isolated function headerValue(blobs:ResponseHeaders headers, string name) return
 }
 
 // Reports whether a connector error represents a 404 (blob or container not found), used to
-// disambiguate file-vs-folder paths and to honour `tolerateMissing`.
+// disambiguate file-vs-folder paths.
 isolated function isNotFoundError(error e) returns boolean {
     // A `blobs:ServerError` carries the status and the Azure error code as typed fields, so it
     // ANSWERS THE QUESTION on its own — no message heuristic runs against it. Falling through
     // to the text match would let a 500 whose body happens to say "not found" be treated as a
-    // missing blob, which under `tolerateMissing` silently drops a container that was really
-    // erroring. The heuristics below exist only for errors that carry no status at all.
+    // missing blob. The heuristics below exist only for errors that carry no status at all.
     if e is blobs:ServerError {
         blobs:ServerErrorDetail detail = e.detail();
         return detail.httpStatus == 404 || detail.errorCode.toLowerAscii().includes("notfound");

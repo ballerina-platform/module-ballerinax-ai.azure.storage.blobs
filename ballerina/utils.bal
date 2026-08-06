@@ -267,20 +267,6 @@ isolated function toUtc(string? dateTime) returns time:Utc? {
     return utc is time:Utc ? utc : ();
 }
 
-// Removes duplicate strings, preserving first-appearance order (used to de-dup container
-// names returned by a paginated `listContainers`).
-isolated function dedupeStrings(string[] values) returns string[] {
-    string[] result = [];
-    map<boolean> seen = {};
-    foreach string value in values {
-        if !seen.hasKey(value) {
-            seen[value] = true;
-            result.push(value);
-        }
-    }
-    return result;
-}
-
 // Normalizes a configured blob path into an Azure blob-name prefix: trims it, drops a
 // leading `/` (Azure blob names have no leading slash), and maps the container root
 // (`""`/`"/"`) to `""`. A trailing `/` is preserved, since it distinguishes an explicit

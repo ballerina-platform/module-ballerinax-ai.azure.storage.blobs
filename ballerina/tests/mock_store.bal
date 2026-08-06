@@ -53,7 +53,6 @@ isolated client class MockBlobStore {
     *BlobStore;
 
     private final readonly & MockBlob[] blobs;
-    private final readonly & string[] containers;
     private final int pageSize;
     private final boolean stickyMarker;
 
@@ -61,42 +60,25 @@ isolated client class MockBlobStore {
     private string[] fetched = [];
 
     // + blobs - the account's contents
-    // + containers - container names, in listing order. Defaults to those the blobs imply, in
-    //                first-appearance order; give it explicitly to include an EMPTY container
-    // + pageSize - blobs (and containers) per page, driving `NextMarker` pagination
+    // + pageSize - blobs per page, driving `NextMarker` pagination
     // + stickyMarker - when true, every page returns the FIRST page's marker instead of
     //                  advancing. Models a service or proxy whose cursor never moves, which
     //                  would spin the loader's `while true` forever
-    isolated function init(MockBlob[] blobs, string[]? containers = (), int pageSize = 1000,
-            boolean stickyMarker = false) {
+    isolated function init(MockBlob[] blobs, int pageSize = 1000, boolean stickyMarker = false) {
         self.blobs = blobs.cloneReadOnly();
-        self.containers = (containers ?: containersOf(blobs)).cloneReadOnly();
         self.pageSize = pageSize;
         self.stickyMarker = stickyMarker;
     }
 
-    isolated remote function listContainers(string? marker) returns blobs:ListContainerResult|error {
-        int[] window = check pageWindow(marker, self.containers.length(), self.pageSize);
-        blobs:Container[] page = [];
-        foreach int i in window[0] ..< window[1] {
-            page.push({Name: self.containers[i], Properties: {}});
-        }
-        return {
-            containerList: page,
-            nextMarker: self.markerFor(window[1], self.containers.length()),
-            responseHeaders: emptyHeaders()
-        };
-    }
-
     isolated remote function listBlobs(string container, string? marker, string? prefix)
             returns blobs:ListBlobResult|error {
-        if self.containers.indexOf(container) is () {
-            return containerNotFound(container);
-        }
         // No delimiter: a prefix listing matches at every depth beneath it.
         MockBlob[] matching = from MockBlob blob in self.blobs
             where blob.container == container && (prefix is () || blob.name.startsWith(prefix))
             select blob;
+        if matching.length() == 0 && !self.blobs.some(blob => blob.container == container) {
+            return containerNotFound(container);
+        }
         int[] window = check pageWindow(marker, matching.length(), self.pageSize);
         blobs:Blob[] page = [];
         foreach int i in window[0] ..< window[1] {
@@ -190,17 +172,6 @@ isolated client class MockBlobStore {
 // does not yet have.
 const string MOCK_LAST_MODIFIED = "Thu, 10 Mar 2022 11:00:00 GMT";
 const string MOCK_CREATION_TIME = "Wed, 09 Mar 2022 10:00:00 GMT";
-
-// Container names implied by the blobs, in first-appearance order.
-isolated function containersOf(MockBlob[] blobs) returns string[] {
-    string[] names = [];
-    foreach MockBlob blob in blobs {
-        if names.indexOf(blob.container) is () {
-            names.push(blob.container);
-        }
-    }
-    return names;
-}
 
 // Resolves a `NextMarker` cursor to a `[start, end)` window. The marker is the index the last
 // page stopped at, matching how the loader feeds `nextMarker` straight back.
